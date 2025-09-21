@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel>=0.40.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnifinan"
+version = "0.1a1"
+description = "Integrated Tools for Financial Analysis"
+authors = [
+    {name = "Dongkai", email = "dongkai001@e.ntu.edu.sg"}
+]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Financial Analysis",
+    "Topic :: Financial Analysis :: Information Analysis",
+    "Topic :: Financial Analysis :: Visualization",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+keywords = [
+    "financial-analysis",
+    "financial-data",
+    "ai",
+    "machine-learning",
+    "visualization",
+]
+urls = {Homepage = "https://github.com/panasee/PyOmnix", Repository = "https://github.com/panasee/PyOmnix.git"}
+dependencies = [
+    "akshare",
+    "pyomnix"
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.10.0",
+    "mypy>=1.15.0",
+    "black>=25.1.0",
+    "isort>=6.0.1",
+    "pre-commit>=4.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["omnifinan*"]
+exclude = ["tests*", "docs*", "examples*", "*.tests", "*.tests.*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E", "F", "B", "I", "N", "UP", "PL", "RUF"]
+ignore = []
