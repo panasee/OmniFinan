@@ -1,9 +1,9 @@
+from pyomnix.consts import ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from rich.console import Console
 from rich.live import Live
 from rich.style import Style
 from rich.table import Table
 from rich.text import Text
-from pyomnix.consts import SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 
 console = Console()
 

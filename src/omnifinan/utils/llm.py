@@ -4,7 +4,6 @@ import json
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
-
 from pyomnix.model_interface.models import RawModels
 from pyomnix.omnix_logger import get_logger
 
@@ -73,10 +72,7 @@ def create_default_response(model_class: type[T]) -> T:
             default_values[field_name] = 0.0
         elif field.annotation == int:
             default_values[field_name] = 0
-        elif (
-            hasattr(field.annotation, "__origin__")
-            and field.annotation.__origin__ == dict
-        ):
+        elif hasattr(field.annotation, "__origin__") and field.annotation.__origin__ == dict:
             default_values[field_name] = {}
         # For other types (like Literal), try to use the first allowed value
         elif hasattr(field.annotation, "__args__"):

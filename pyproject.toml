@@ -20,9 +20,6 @@ classifiers = [
     "Topic :: Financial Analysis",
     "Topic :: Financial Analysis :: Information Analysis",
     "Topic :: Financial Analysis :: Visualization",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
 ]
 keywords = [
     "financial-analysis",
@@ -33,7 +30,15 @@ keywords = [
 ]
 urls = {Homepage = "https://github.com/panasee/PyOmnix", Repository = "https://github.com/panasee/PyOmnix.git"}
 dependencies = [
+    "numpy",
+    "pandas",
+    "requests",
     "akshare",
+    "pydantic",
+    "langchain",
+    "TA-Lib",
+    "plotly",
+    "pandas-market-calendars",
     "pyomnix"
 ]
 

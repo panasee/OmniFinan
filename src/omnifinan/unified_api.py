@@ -21,11 +21,14 @@ from typing import Any, Literal  # Added Any for flexibility with model fields
 
 import akshare as ak
 import pandas as pd
-
 from pyomnix.consts import OMNIX_PATH
 
+# Assuming omnix_logger and data_models are in the same package structure
+# If not, adjust the import paths accordingly
+from pyomnix.omnix_logger import get_logger
+
 # Import data models (assuming they are defined correctly AND reflect the original structure)
-from pyomnix.financial.data_models import (
+from .data_models import (
     CompanyNews,
     FinancialMetrics,
     InsiderTrade,
@@ -33,10 +36,6 @@ from pyomnix.financial.data_models import (
     MarketType,
     Price,
 )
-
-# Assuming omnix_logger and data_models are in the same package structure
-# If not, adjust the import paths accordingly
-from pyomnix.omnix_logger import get_logger
 
 # 获取当前模块的路径
 
@@ -61,7 +60,7 @@ def normalize_ticker(ticker: str) -> str:
     """
     # Remove common exchange suffixes
     ticker = re.sub(
-        r"\.(SH|SZ|HK|O|N|L|DE|PA|AS|MI|VX|SW|CO|HE|ST|OL|IC|KS|KQ|TWO|TW|BK|CR|SA|TL|JK|NZ|AX|IS|TO|NE|BR|VI)$",
+        r"\.(US|SH|SZ|HK|O|N|L|DE|PA|AS|MI|VX|SW|CO|HE|ST|OL|IC|KS|KQ|TWO|TW|BK|CR|SA|TL|JK|NZ|AX|IS|TO|NE|BR|VI)$",
         "",
         ticker.upper(),
         flags=re.IGNORECASE,
@@ -87,15 +86,20 @@ def detect_market(normalized_ticker: str) -> MarketType:
         logger.debug(f"Detected Market: HK for {normalized_ticker}")
         return MarketType.HK
 
+    if normalized_ticker == "SH000001":
+        return MarketType.CHINA_SH
+
     # China A-shares: 6 digits
     if re.match(r"^\d{6}$", normalized_ticker):
         # Shanghai (SH) stocks start with 6 or 9
-        if normalized_ticker.startswith(("6", "9")):
+        if normalized_ticker.startswith(("5", "6", "9")):
             logger.debug(f"Detected Market: CHINA (SH) for {normalized_ticker}")
             return MarketType.CHINA_SH
         # Shenzhen (SZ) stocks start with 0, 3, or 2
         elif normalized_ticker.startswith(("0", "3", "2", "4", "8")):
             logger.debug(f"Detected Market: CHINA (SZ) for {normalized_ticker}")
+            if normalized_ticker == "000001":
+                logger.info(f"Use sh000001 for SSE Index")
             return MarketType.CHINA_SZ
         elif normalized_ticker.startswith(("4", "8")):
             logger.debug(f"Detected Market: CHINA (BJ) for {normalized_ticker}")
@@ -165,9 +169,7 @@ def _format_output_date(date_input) -> str | None:
     return None  # Fallback
 
 
-def _get_value_from_row(
-    row: pd.Series, key: str, converter: callable, default=None
-) -> Any:
+def _get_value_from_row(row: pd.Series, key: str, converter: callable, default=None) -> Any:
     """Gets value from series, handles missing key, calls converter."""
     if key in row.index:
         return converter(row.get(key))
@@ -201,6 +203,8 @@ def get_prices(
     """
     normalized_ticker = normalize_ticker(ticker)
     market = detect_market(normalized_ticker)
+    if normalized_ticker == "SH000001":
+        normalized_ticker = "000001"
 
     end_date_ak = _format_date(end_date, default_delta_days=0)
     if start_date:
@@ -302,9 +306,7 @@ def get_prices(
             logger.info(f"Successfully fetched stock data for {normalized_ticker}")
 
         if df is None or df.empty:
-            logger.warning(
-                f"No price data found for {normalized_ticker} in the specified range."
-            )
+            logger.warning(f"No price data found for {normalized_ticker} in the specified range.")
             return []
 
         # Add missing columns that might be expected in the Price model
@@ -328,16 +330,12 @@ def get_prices(
                 low=_get_value_from_row(row, "low", _safe_float_convert),
                 close=_get_value_from_row(row, "close", _safe_float_convert),
                 volume=_get_value_from_row(row, "volume", _safe_int_convert),
-                time=_get_value_from_row(
-                    row, "date", _format_output_date
-                ),  # Format date string
+                time=_get_value_from_row(row, "date", _format_output_date),  # Format date string
                 # Fields potentially missing in US/HK data:
                 amount=_get_value_from_row(row, "amount", _safe_float_convert),
                 amplitude=_get_value_from_row(row, "amplitude", _safe_float_convert),
                 pct_change=_get_value_from_row(row, "pct_change", _safe_float_convert),
-                change_amount=_get_value_from_row(
-                    row, "change_amount", _safe_float_convert
-                ),
+                change_amount=_get_value_from_row(row, "change_amount", _safe_float_convert),
                 turnover=_get_value_from_row(row, "turnover", _safe_float_convert),
                 # Market field
                 market=market,
@@ -349,9 +347,7 @@ def get_prices(
         )
 
     except Exception as e:
-        logger.error(
-            f"Error getting price history for {normalized_ticker}: {e}", exc_info=True
-        )
+        logger.error(f"Error getting price history for {normalized_ticker}: {e}", exc_info=True)
         return []
 
     return prices_list
@@ -406,22 +402,21 @@ def get_financial_metrics(
     Returns:
         List[FinancialMetrics]: List containing FinancialMetrics object(s) matching original structure.
     """
+    #TODO
+    logger.warning(f"sockets still need to be supplemented")
+
     if manual_input is not None:
         metric_data = manual_input
 
     else:
         normalized_ticker = normalize_ticker(ticker)
         market = detect_market(normalized_ticker)
-        logger.info(
-            f"Getting financial metrics for {normalized_ticker} ({market.name})..."
-        )
+        logger.info(f"Getting financial metrics for {normalized_ticker} ({market.name})...")
 
         # Initialize all fields from the original model with None or defaults
         metric_data = {
             "ticker": normalized_ticker,
-            "report_period": end_date
-            if end_date
-            else datetime.now().strftime("%Y-%m-%d"),
+            "report_period": end_date if end_date else datetime.now().strftime("%Y-%m-%d"),
             "period": period,
             "currency": "USD"
             if market == MarketType.US
@@ -456,31 +451,23 @@ def get_financial_metrics(
                 if not q_df.empty:
                     quote_data = q_df.iloc[0]
                 else:
-                    logger.warning(
-                        f"Could not fetch US quote data for {normalized_ticker}"
-                    )
+                    logger.warning(f"Could not fetch US quote data for {normalized_ticker}")
             elif market == MarketType.HK:
                 q_df = ak.stock_individual_basic_info_hk_xq(symbol=normalized_ticker)
                 if not q_df.empty:
                     quote_data = q_df.iloc[0]
                 else:
-                    logger.warning(
-                        f"Could not fetch HK quote data for {normalized_ticker}"
-                    )
+                    logger.warning(f"Could not fetch HK quote data for {normalized_ticker}")
             else:  # MarketType.CHINA
                 # Calculate Market Cap
                 latest_price = None
-                prices = get_prices(
-                    normalized_ticker, end_date=datetime.now().strftime("%Y-%m-%d")
-                )
+                prices = get_prices(normalized_ticker, end_date=datetime.now().strftime("%Y-%m-%d"))
                 if prices:
                     latest_price = prices[-1].close
 
                 total_shares = None
                 try:
-                    info_df = ak.stock_individual_info_em(
-                        symbol=normalized_ticker, timeout=20
-                    )
+                    info_df = ak.stock_individual_info_em(symbol=normalized_ticker, timeout=20)
                     total_shares_series = info_df[info_df["item"] == "总股本"]["value"]
                     if not total_shares_series.empty:
                         value_str = total_shares_series.iloc[0]
@@ -488,11 +475,7 @@ def get_financial_metrics(
                         if num_part_list:
                             num_part = num_part_list[0]
                             multiplier = (
-                                1e8
-                                if "亿" in value_str
-                                else 1e4
-                                if "万" in value_str
-                                else 1
+                                1e8 if "亿" in value_str else 1e4 if "万" in value_str else 1
                             )
                             total_shares = float(num_part) * multiplier
                 except Exception as e_info:
@@ -511,9 +494,7 @@ def get_financial_metrics(
                     )
                     if not ind_df.empty:
                         ind_df["日期"] = pd.to_datetime(ind_df["日期"])
-                        indicator_data = ind_df.sort_values(
-                            "日期", ascending=False
-                        ).iloc[0]
+                        indicator_data = ind_df.sort_values("日期", ascending=False).iloc[0]
                 except Exception as e_ind:
                     logger.warning(
                         f"Failed fetching CN financial indicators for {normalized_ticker}: {e_ind}"
@@ -523,13 +504,9 @@ def get_financial_metrics(
 
             # Market Cap
             if market == MarketType.US:
-                metric_data["market_cap"] = _safe_float_convert(
-                    quote_data.get("market_capital")
-                )
+                metric_data["market_cap"] = _safe_float_convert(quote_data.get("market_capital"))
             elif market == MarketType.HK:
-                metric_data["market_cap"] = _safe_float_convert(
-                    quote_data.get("market_value")
-                )
+                metric_data["market_cap"] = _safe_float_convert(quote_data.get("market_value"))
             else:  # CN
                 metric_data["market_cap"] = calculated_market_cap  # Already calculated
 
@@ -545,8 +522,7 @@ def get_financial_metrics(
 
             # PB Ratio (Only available from CN indicators in this setup)
             if (
-                market
-                in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
+                market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
                 and not indicator_data.empty
             ):
                 metric_data["price_to_book_ratio"] = _safe_float_convert(
@@ -555,8 +531,7 @@ def get_financial_metrics(
 
             # Update report_period if CN indicators provided a date
             if (
-                market
-                in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
+                market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
                 and not indicator_data.empty
             ):
                 indicator_date = _format_output_date(indicator_data.get("日期"))
@@ -565,8 +540,7 @@ def get_financial_metrics(
 
             # CN Specific Metrics from Indicators
             if (
-                market
-                in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
+                market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
                 and not indicator_data.empty
             ):
 
@@ -583,12 +557,8 @@ def get_financial_metrics(
                 metric_data["return_on_equity"] = _parse_indicator(
                     "净资产收益率ROE(加权)", is_percent=True
                 )
-                metric_data["net_margin"] = _parse_indicator(
-                    "销售净利率(%)", is_percent=True
-                )
-                metric_data["operating_margin"] = _parse_indicator(
-                    "营业利润率(%)", is_percent=True
-                )
+                metric_data["net_margin"] = _parse_indicator("销售净利率(%)", is_percent=True)
+                metric_data["operating_margin"] = _parse_indicator("营业利润率(%)", is_percent=True)
                 metric_data["revenue_growth"] = _parse_indicator(
                     "主营业务收入增长率(%)", is_percent=True
                 )
@@ -638,11 +608,12 @@ def search_line_items(
     Returns:
         List[LineItem]: List of LineItem objects matching original structure.
     """
+    #TODO
+    logger.warning(f"sockets still need to be supplemented")
+
     normalized_ticker = normalize_ticker(ticker)
     market = detect_market(normalized_ticker)
-    logger.info(
-        f"Getting financial statement data for {normalized_ticker} ({market.name})"
-    )
+    logger.info(f"Getting financial statement data for {normalized_ticker} ({market.name})")
 
     results = []
     fetched_data = {}  # Store dataframes: {'balance': df, 'income': df, 'cashflow': df}
@@ -705,17 +676,11 @@ def search_line_items(
             for col in possible_date_cols:
                 if col in fetched_data["income"].columns:
                     date_col_name = col
-                    report_dates.update(
-                        fetched_data["income"][date_col_name].astype(str).tolist()
-                    )
-                    logger.info(
-                        f"Using date column '{date_col_name}' for report periods."
-                    )
+                    report_dates.update(fetched_data["income"][date_col_name].astype(str).tolist())
+                    logger.info(f"Using date column '{date_col_name}' for report periods.")
                     break
             if not report_dates:
-                logger.warning(
-                    "Could not identify a suitable date column in the income statement."
-                )
+                logger.warning("Could not identify a suitable date column in the income statement.")
 
         if not report_dates:
             logger.warning(
@@ -740,16 +705,12 @@ def search_line_items(
                         mask = df[date_col_name].astype(str) == report_date_str
                         if mask.sum() == 0:
                             mask = (
-                                pd.to_datetime(df[date_col_name]).dt.strftime(
-                                    "%Y-%m-%d"
-                                )
+                                pd.to_datetime(df[date_col_name]).dt.strftime("%Y-%m-%d")
                                 == report_date_str
                             )
                         if "STD_ITEM_NAME" in df.columns:
                             tmp = df[mask][["STD_ITEM_NAME", "AMOUNT"]].transpose()
-                            row_series = tmp.rename(columns=tmp.iloc[0]).drop(
-                                index="STD_ITEM_NAME"
-                            )
+                            row_series = tmp.rename(columns=tmp.iloc[0]).drop(index="STD_ITEM_NAME")
                         else:
                             row_series = df[mask]
                         if not row_series.empty:
@@ -772,11 +733,7 @@ def search_line_items(
             # Use original requested period string or sequence if multiple periods
             item_data["period"] = f"{period}_{processed_count}" if limit > 1 else period
             item_data["currency"] = (
-                "USD"
-                if market == MarketType.US
-                else "HKD"
-                if market == MarketType.HK
-                else "CNY"
+                "USD" if market == MarketType.US else "HKD" if market == MarketType.HK else "CNY"
             )
 
             # Base items (handle potential missing rows)
@@ -784,9 +741,7 @@ def search_line_items(
                 income_row, "净利润", _safe_float_convert
             )  # Or "归属于母公司所有者的净利润"
             if ni is None:
-                ni = _get_value_from_row(
-                    income_row, "股东应占溢利", _safe_float_convert
-                )
+                ni = _get_value_from_row(income_row, "股东应占溢利", _safe_float_convert)
             rev = _get_value_from_row(income_row, "营业总收入", _safe_float_convert)
             if rev is None:
                 rev = _get_value_from_row(income_row, "营运收入", _safe_float_convert)
@@ -796,25 +751,19 @@ def search_line_items(
             ca = _get_value_from_row(balance_row, "流动资产合计", _safe_float_convert)
             cl = _get_value_from_row(balance_row, "流动负债", _safe_float_convert)
             if cl is None:
-                cl = _get_value_from_row(
-                    balance_row, "流动负债合计", _safe_float_convert
-                )
+                cl = _get_value_from_row(balance_row, "流动负债合计", _safe_float_convert)
             cfo = _get_value_from_row(
                 cashflow_row, "经营活动产生的现金流量净额", _safe_float_convert
             )
             if cfo is None:
-                cfo = _get_value_from_row(
-                    cashflow_row, "经营业务现金净额", _safe_float_convert
-                )
+                cfo = _get_value_from_row(cashflow_row, "经营业务现金净额", _safe_float_convert)
             dep_amort = _get_value_from_row(
                 cashflow_row,
                 "固定资产折旧、油气资产折耗、生产性生物资产折旧",
                 _safe_float_convert,
             )  # Or sum of relevant lines
             if dep_amort is None:
-                dep_amort = _get_value_from_row(
-                    cashflow_row, "减值及拨备", _safe_float_convert
-                )
+                dep_amort = _get_value_from_row(cashflow_row, "减值及拨备", _safe_float_convert)
             capex_paid = _get_value_from_row(
                 cashflow_row,
                 "购建固定资产、无形资产和其他长期资产所支付的现金",
@@ -831,12 +780,8 @@ def search_line_items(
             item_data["depreciation_and_amortization"] = dep_amort
 
             # Calculated items
-            item_data["working_capital"] = (
-                (ca - cl) if ca is not None and cl is not None else None
-            )
-            item_data["capital_expenditure"] = (
-                abs(capex_paid) if capex_paid is not None else None
-            )
+            item_data["working_capital"] = (ca - cl) if ca is not None and cl is not None else None
+            item_data["capital_expenditure"] = abs(capex_paid) if capex_paid is not None else None
             item_data["free_cash_flow"] = (
                 (cfo - item_data["capital_expenditure"])
                 if cfo is not None and item_data["capital_expenditure"] is not None
@@ -844,9 +789,7 @@ def search_line_items(
             )
 
             try:
-                results.append(
-                    LineItem(**item_data)
-                )  # Pass the dict containing potential Nones
+                results.append(LineItem(**item_data))  # Pass the dict containing potential Nones
                 processed_count += 1
             except Exception as model_error:
                 logger.error(
@@ -917,9 +860,7 @@ def get_insider_trades(
                     end_dt = pd.to_datetime(end_date)
                     df = df[df[date_col].dt.date <= end_dt.date()]
             except Exception as date_e:
-                logger.warning(
-                    f"Could not perform date filtering on insider trades: {date_e}"
-                )
+                logger.warning(f"Could not perform date filtering on insider trades: {date_e}")
         else:
             logger.warning(f"Date column '{date_col}' not found for insider trades.")
 
@@ -934,18 +875,12 @@ def get_insider_trades(
                     row, "内部人名称", str, default=""
                 ),  # Assuming string, provide default
                 insider_relation=_get_value_from_row(row, "职务", str, default=""),
-                transaction_date=_get_value_from_row(
-                    row, date_col, _format_output_date
-                ),
+                transaction_date=_get_value_from_row(row, date_col, _format_output_date),
                 transaction_type=_get_value_from_row(
                     row, "交易", str, default=""
                 ),  # e.g., 'Sale', 'Buy'
-                shares_transacted=_get_value_from_row(
-                    row, "交易股数", _safe_int_convert
-                ),
-                shares_held_after=_get_value_from_row(
-                    row, "持有股数", _safe_int_convert
-                ),
+                shares_transacted=_get_value_from_row(row, "交易股数", _safe_int_convert),
+                shares_held_after=_get_value_from_row(row, "持有股数", _safe_int_convert),
                 trade_price=_get_value_from_row(
                     row, "交易价格", _safe_float_convert
                 ),  # Might be avg price
@@ -958,9 +893,7 @@ def get_insider_trades(
         )
 
     except Exception as e:
-        logger.error(
-            f"Error getting insider trades for {normalized_ticker}: {e}", exc_info=True
-        )
+        logger.error(f"Error getting insider trades for {normalized_ticker}: {e}", exc_info=True)
         return []
 
     return trades
@@ -1067,9 +1000,7 @@ def get_stock_news(
             try:
                 # 获取新闻内容
                 content = (
-                    row["新闻内容"]
-                    if "新闻内容" in row and not pd.isna(row["新闻内容"])
-                    else ""
+                    row["新闻内容"] if "新闻内容" in row and not pd.isna(row["新闻内容"]) else ""
                 )
                 if not content:
                     content = row["新闻标题"]
@@ -1080,11 +1011,7 @@ def get_stock_news(
                     continue
 
                 # 获取关键词
-                keyword = (
-                    row["关键词"]
-                    if "关键词" in row and not pd.isna(row["关键词"])
-                    else ""
-                )
+                keyword = row["关键词"] if "关键词" in row and not pd.isna(row["关键词"]) else ""
 
                 # 添加新闻
                 news_item = {
@@ -1149,9 +1076,7 @@ def get_market_cap(
     # TODO: auto-retrieval currently unavailable
     normalized_ticker = normalize_ticker(ticker)
     market = detect_market(normalized_ticker)
-    logger.info(
-        f"Fetching latest market cap for {normalized_ticker} ({market.name})..."
-    )
+    logger.info(f"Fetching latest market cap for {normalized_ticker} ({market.name})...")
 
     market_cap = None
     try:
@@ -1160,18 +1085,14 @@ def get_market_cap(
             if not quote_df.empty:
                 market_cap = _safe_float_convert(quote_df.iloc[0].get("market_capital"))
             else:
-                logger.warning(
-                    f"Could not fetch US quote data for market cap: {normalized_ticker}"
-                )
+                logger.warning(f"Could not fetch US quote data for market cap: {normalized_ticker}")
 
         elif market == MarketType.HK:
             quote_df = ak.stock_quote_hk_sina(symbol=normalized_ticker)
             if not quote_df.empty:
                 market_cap = _safe_float_convert(quote_df.iloc[0].get("market_value"))
             else:
-                logger.warning(
-                    f"Could not fetch HK quote data for market cap: {normalized_ticker}"
-                )
+                logger.warning(f"Could not fetch HK quote data for market cap: {normalized_ticker}")
 
         else:  # MarketType.CHINA
             latest_price = None
@@ -1194,26 +1115,14 @@ def get_market_cap(
                     num_part_list = re.findall(r"[\d\.]+", value_str)
                     if num_part_list:
                         num_part = num_part_list[0]
-                        multiplier = (
-                            1e8
-                            if "亿" in value_str
-                            else 1e4
-                            if "万" in value_str
-                            else 1
-                        )
+                        multiplier = 1e8 if "亿" in value_str else 1e4 if "万" in value_str else 1
                         total_shares = float(num_part) * multiplier
                     else:
-                        logger.warning(
-                            f"Could not parse number from '总股本' value: {value_str}"
-                        )
+                        logger.warning(f"Could not parse number from '总股本' value: {value_str}")
                 else:
-                    logger.warning(
-                        f"Could not find '总股本' in info for CN {normalized_ticker}"
-                    )
+                    logger.warning(f"Could not find '总股本' in info for CN {normalized_ticker}")
             except Exception as e_info:
-                logger.warning(
-                    f"Failed to get total shares for CN {normalized_ticker}: {e_info}"
-                )
+                logger.warning(f"Failed to get total shares for CN {normalized_ticker}: {e_info}")
 
             if (
                 latest_price is not None
@@ -1234,9 +1143,7 @@ def get_market_cap(
         return market_cap
 
     except Exception as e:
-        logger.error(
-            f"Error getting market cap for {normalized_ticker}: {e}", exc_info=True
-        )
+        logger.error(f"Error getting market cap for {normalized_ticker}: {e}", exc_info=True)
         return None
 
 
@@ -1271,9 +1178,7 @@ def prices_to_df(prices: list[Price]) -> pd.DataFrame:
     # Set index - use 'time' field as defined in Price model
     date_col = "time"
     if date_col not in df.columns:
-        logger.error(
-            f"Date column '{date_col}' not found in Price data for DataFrame conversion."
-        )
+        logger.error(f"Date column '{date_col}' not found in Price data for DataFrame conversion.")
         return df  # Return df without index
 
     try:
@@ -1284,9 +1189,7 @@ def prices_to_df(prices: list[Price]) -> pd.DataFrame:
             df = df.set_index(pd.DatetimeIndex(df[date_col]))
             # Optionally drop the original column if it's now the index name or redundant
             if df.index.name == date_col:
-                pass  # Index name is already 'time'
-            # else: # Drop if index name is different (e.g., 'Date') or keep if needed
-            #     df = df.drop(columns=[date_col])
+                df = df.drop(columns=[date_col])
         else:
             logger.warning("DataFrame empty after dropping rows with invalid dates.")
             return pd.DataFrame()  # Return empty df
@@ -1318,7 +1221,7 @@ def prices_to_df(prices: list[Price]) -> pd.DataFrame:
     return df
 
 
-def get_price_data(
+def get_price_df(
     ticker: str, start_date: str | None = None, end_date: str | None = None
 ) -> pd.DataFrame:
     """
@@ -1351,9 +1254,7 @@ if __name__ == "__main__":
     print("\n--- Testing US Stock (AAPL) ---")
     aapl_ticker = "AAPL"
     try:
-        aapl_prices = get_prices(
-            aapl_ticker, start_date="2024-01-01", end_date="2024-04-01"
-        )
+        aapl_prices = get_prices(aapl_ticker, start_date="2024-01-01", end_date="2024-04-01")
         if aapl_prices:
             print(f"AAPL Prices (last 2): {aapl_prices[-2:]}")
             aapl_df = prices_to_df(aapl_prices)
@@ -1399,12 +1300,10 @@ if __name__ == "__main__":
     print("\n--- Testing HK Stock (00700) ---")
     tencent_ticker = "00700"  # Tencent
     try:
-        tencent_prices = get_prices(
-            tencent_ticker, start_date="2024-01-01", end_date="2024-04-01"
-        )
+        tencent_prices = get_prices(tencent_ticker, start_date="2024-01-01", end_date="2024-04-01")
         if tencent_prices:
             print(f"Tencent Prices (last 2): {tencent_prices[-2:]}")
-            tencent_df = get_price_data(
+            tencent_df = get_price_df(
                 tencent_ticker, start_date="2024-01-01", end_date="2024-04-01"
             )
             print(f"Tencent Price DataFrame tail:\n{tencent_df.tail(2)}")
@@ -1441,12 +1340,10 @@ if __name__ == "__main__":
     print("\n--- Testing CN Stock (600519) ---")
     moutai_ticker = "600519"  # Kweichow Moutai
     try:
-        moutai_prices = get_prices(
-            moutai_ticker, start_date="2024-01-01", end_date="2024-04-01"
-        )
+        moutai_prices = get_prices(moutai_ticker, start_date="2024-01-01", end_date="2024-04-01")
         if moutai_prices:
             print(f"Moutai Prices (last 2): {moutai_prices[-2:]}")
-            moutai_df = get_price_data(
+            moutai_df = get_price_df(
                 moutai_ticker, start_date="2024-01-01", end_date="2024-04-01"
             )
             print(f"Moutai Price DataFrame tail:\n{moutai_df.tail(2)}")
@@ -1474,9 +1371,7 @@ if __name__ == "__main__":
         print(f"Error getting Moutai news: {e}")
 
     try:
-        moutai_items = search_line_items(
-            moutai_ticker, limit=2
-        )  # Get latest 2 periods
+        moutai_items = search_line_items(moutai_ticker, limit=2)  # Get latest 2 periods
         print(f"Moutai Line Items (latest 2): {moutai_items}")
     except Exception as e:
         print(f"Error getting Moutai line items: {e}")

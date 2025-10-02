@@ -10,7 +10,7 @@ from .unified_api import (
     get_financial_metrics,
     get_insider_trades,
     get_market_cap,
-    get_price_data,
+    get_price_df,
     get_prices,
     prices_to_df,
     search_line_items,
