@@ -5,11 +5,13 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import talib as ta
 from langchain_core.runnables.graph import MermaidDrawMethod
 from pyomnix.data_process import DataManipulator
 from pyomnix.omnix_logger import get_logger
 from pyomnix.utils import ObjectArray
 
+from omnifinan.analysis.indicators import cross_over, cross_under
 from omnifinan.utils import compute_rangebreaks, filter_trading_days
 
 logger = get_logger("visualize")
@@ -32,7 +34,7 @@ DEFAULT_CANDLE_SPEC = {
 }
 
 DEFAULT_BAR_SPEC = {
-    "width": 1000 * 60 * 60 * 24 * 0.8, # default using milliseconds
+    "width": 1000 * 60 * 60 * 24 * 0.8,  # default using milliseconds
     "opacity": 0.3,
 }
 
@@ -53,6 +55,8 @@ DEFAULT_SCATTER_SPEC = {
     },
 }
 
+VOLUME_DEF = "volume"  # default to成交量
+
 
 def save_graph_as_png(app, output_file_path: Path) -> None:
     png_image = app.get_graph().draw_mermaid_png(draw_method=MermaidDrawMethod.API)
@@ -68,6 +72,7 @@ class StockFigure:
     figures, containing a main figure and n_subfig subfigures below it
     2. [(1+n_subfig)*n_rows] * n_cols structure, the actual figure array, used only for add_trace
     """
+
     def __init__(
         self,
         n_rows: int = 1,
@@ -81,7 +86,7 @@ class StockFigure:
         self.sub_rows = 1 + no_subfig  # rows of per group
         # the datas are stored w.r.t. subgroups not separate figures
         self.plotobj = DataManipulator(n_rows, n_cols, data_fill_value={"candle": [], "vol": []})
-        self.markets = np.empty((n_rows, n_cols), dtype=str)
+        self.markets = np.empty((n_rows, n_cols), dtype=object)
         self.plot_datas = self.plotobj.datas  # just an ObjectArray used for real-time plotting
         self.data_dfs = ObjectArray(n_rows, n_cols)  # used for data calculation
         self.fig = self._create_fig_and_arrange_data(
@@ -141,8 +146,8 @@ class StockFigure:
         fig = self.plotobj.create_plotly_figure(
             actual_rows,
             n_cols,
-            width,
             height,
+            width,
             specs=specs,
             row_heights=row_heights,
             shared_xaxes=True,
@@ -238,7 +243,7 @@ class StockFigure:
         x_arr: Sequence[Any] | None = None,
         volume_arr: Sequence[float] | None = None,
         plot_spec: dict[str, Any] | None = None,
-        volume_def: Literal["volume", "amount"] = "amount",
+        volume_def: Literal["volume", "amount"] = VOLUME_DEF,
     ) -> None:
         if plot_spec is not None:
             vol_spec: dict[str, Any] = DEFAULT_BAR_SPEC.copy()
@@ -308,7 +313,7 @@ class StockFigure:
             secondary_y=True,
         )
         self.fig.update_yaxes(
-            range=[0, vol_max*3],
+            range=[0, vol_max * 3],
             secondary_y=True,
             row=row * self.sub_rows + 1,
             col=col + 1,
@@ -348,12 +353,84 @@ class StockFigure:
                 else self.data_dfs[row, col]["time"],
                 y=y_arr,
                 name=f"{label}-{row}-{col}",
+                hoverinfo="none",
                 **scatter_spec,
             ),
             row=row * self.sub_rows + 1 + position,
             col=col + 1,
             secondary_y=secondary_y,
         )
+        self.plot_datas[row, col][label] = self.fig.data[-1]
+
+
+    def add_marker_trace(
+        self,
+        row: int = 0,
+        col: int = 0,
+        label: str = "custom",
+        position: int = 0,
+        *,
+        secondary_y: bool = False,
+        x_arr: Sequence[Any],
+        y_arr: Sequence[float],
+        type: Literal["markers", "text"] = "markers",
+        marker: dict[str, Any] | None = None,
+        text: Sequence[str] | None = None,
+    ) -> None:
+        """
+        Args:
+            row: int, row index of the subplot.
+            col: int, column index of the subplot.
+            label: str, label of the trace.
+            position: int, position of the trace. 0 for main figure, i=1-N for the i-th subfigure.
+        """
+        if type == "markers":
+            logger.validate(marker is not None, "marker_spec must be provided")
+            marker_spec = {
+                "symbol": marker,
+                "color": "#9b1b30",
+                "size": 14,
+                "line": {
+                    "color": "#0a6f69",
+                    "width": 1,
+                },
+            }
+            marker_spec.update(marker)
+            self.fig.add_trace(
+                go.Scatter(
+                    x=x_arr,
+                    y=y_arr,
+                    mode="markers",
+                    name=f"{label}-{row}-{col}",
+                    marker=marker_spec,
+                    showlegend=False,
+                ),
+                row=row * self.sub_rows + 1 + position,
+                col=col + 1,
+                secondary_y=secondary_y,
+            )
+        elif type == "text":
+            logger.validate(text is not None, "text must be provided")
+            logger.validate(len(x_arr) == len(text), "x_arr and text must have the same length")
+            textfont = {
+                "color": "#9b1b30",
+                "size": 14,
+                "family": "Arial",
+                "weight": "bold",
+            }
+            self.fig.add_trace(
+                go.Scatter(
+                    x=x_arr,
+                    y=y_arr,
+                    mode="text",
+                    name=f"{label}-{row}-{col}",
+                    text=text,
+                    textposition="top center",
+                    textfont=textfont,
+                    showlegend=False,
+                    hoverinfo="none",
+                ),
+            )
         self.plot_datas[row, col][label] = self.fig.data[-1]
 
     def list_trace_names(self) -> list[str]:
@@ -384,48 +461,96 @@ class StockFigure:
             # Remove from internal data structure
 
     def preset_main_indicators(self, row: int = 0, col: int = 0) -> None:
-        self.add_scatter_trace(
-            row,
-            col,
-            "MA5",
-            x_arr=self.data_dfs[row, col].index
-            if "time" not in self.data_dfs[row, col].columns
-            else self.data_dfs[row, col]["time"],
-            y_arr=self.data_dfs[row, col]["MA5"],
-        )
-        self.add_scatter_trace(
-            row,
-            col,
-            "MA10",
-            x_arr=self.data_dfs[row, col].index
-            if "time" not in self.data_dfs[row, col].columns
-            else self.data_dfs[row, col]["time"],
-            y_arr=self.data_dfs[row, col]["MA10"],
-        )
-        self.add_scatter_trace(
-            row,
-            col,
-            "MA20",
-            x_arr=self.data_dfs[row, col].index
-            if "time" not in self.data_dfs[row, col].columns
-            else self.data_dfs[row, col]["time"],
-            y_arr=self.data_dfs[row, col]["MA20"],
-        )
-        self.add_scatter_trace(
-            row,
-            col,
-            "MA50",
-            x_arr=self.data_dfs[row, col].index
-            if "time" not in self.data_dfs[row, col].columns
-            else self.data_dfs[row, col]["time"],
-            y_arr=self.data_dfs[row, col]["MA50"],
-        )
-        self.add_scatter_trace(
-            row,
-            col,
-            "MA200",
-            x_arr=self.data_dfs[row, col].index
-            if "time" not in self.data_dfs[row, col].columns
-            else self.data_dfs[row, col]["time"],
-            y_arr=self.data_dfs[row, col]["MA200"],
-        )
+        df = self.data_dfs[row, col]
+        df["avg1"] = (3 * df["close"] + df["high"] + df["low"] + df["open"]) / 6
+
+        df["MA5"] = df["avg1"].rolling(5).mean()
+        df["MA10"] = df["avg1"].rolling(10).mean()
+        df["MA200"] = df["avg1"].rolling(200).mean()
+        df["volMA5"] = df[VOLUME_DEF].rolling(5).mean()
+        df["volMA120"] = df[VOLUME_DEF].rolling(120).mean()
+
+        df["WMA8"] = ta.WMA(df["avg1"], timeperiod=8)
+        df["high_wma"] = (
+            df["WMA8"].rolling(2).max() + df["WMA8"].rolling(4).max() + df["WMA8"].rolling(8).max()
+        ) / 3
+        df["low_wma"] = (
+            df["WMA8"].rolling(2).min() + df["WMA8"].rolling(4).min() + df["WMA8"].rolling(8).min()
+        ) / 3
+
+        df["draw_stop_fall"] = False
+        condition_stop_fall = (df["low_wma"].shift(1) == df["WMA8"].shift(1)) & (df["WMA8"] > df["low_wma"])
+        df.loc[condition_stop_fall, "draw_stop_fall"] = True
+
+        df['high_smoothed'] = ta.EMA(ta.WMA(df['high'], timeperiod=20), timeperiod=90)
+        df['low_smoothed'] = ta.EMA(ta.WMA(df['low'], timeperiod=20), timeperiod=90)
+        df['width'] = df['high_smoothed'] - df['low_smoothed']
+        df['channeltop_longperiod'] = df['high_smoothed'] + df['width'] * 2
+        df['channelbot_longperiod'] = df['low_smoothed'] - df['width'] * 2
+
+        # use XMA as a targeted result
+        df['high_smoothed2'] = ta.EMA(ta.EMA(df['high'], timeperiod=25), timeperiod=25)
+        df['low_smoothed2'] = ta.EMA(ta.EMA(df['low'], timeperiod=25), timeperiod=25)
+        df['width2'] = df['high_smoothed2'] - df['low_smoothed2']
+        df['channeltop_shortperiod'] = df['high_smoothed2'] + df['width2']
+        df['channelbot_shortperiod'] = df['low_smoothed2'] - df['width2']
+
+
+        df['positive'] = (df['channelbot_shortperiod'] >= df['channelbot_longperiod']) & (df['channeltop_shortperiod'] >= df['channeltop_longperiod'])
+        df['negative'] = (df['channeltop_shortperiod'] <= df['channeltop_longperiod']) & (df['channelbot_shortperiod'] <= df['channelbot_longperiod'])
+        df['neutral'] = (df['channelbot_shortperiod'] >= df['channelbot_longperiod']) & (df['channeltop_shortperiod'] <= df['channeltop_longperiod'])
+
+        df['XA_17'] = df['low_smoothed2'] - 1.5 * df['width2']
+        df['MID'] = (df['high_smoothed2'] + df['low_smoothed2']) / 2
+        df['EMA_C_3'] = ta.EMA(df['close'], timeperiod=3)
+        df['EMA_C_6'] = ta.EMA(df['close'], timeperiod=6)
+        df['XA_19'] = ta.EMA(df['EMA_C_3'] - df['EMA_C_6'], timeperiod=9)
+        df['XA_20'] = df['XA_19'].shift(1)
+
+        df['EMA_C_3'] = ta.EMA(df['close'], timeperiod=3)
+        df['EMA_C_9'] = ta.EMA(df['close'], timeperiod=9)
+        df['P2_XA_21_EMA3'] = ta.EMA(df['EMA_C_3'] - df['EMA_C_9'], timeperiod=3)
+        df['P2_XA_21_EMA9'] = ta.EMA(df['EMA_C_3'] - df['EMA_C_9'], timeperiod=9)
+        df['XA_21'] = ta.EMA(df['P2_XA_21_EMA3'] - df['P2_XA_21_EMA9'], timeperiod=9)
+        df['XA_22'] = df['XA_21'].shift(1)
+
+        df['BUY1_SIGNAL'] = cross_over(df['channelbot_shortperiod'], df['low']) & df['positive']
+        df['CAREFUL_SIGNAL_STRONG'] = cross_over(df['high'], df['channeltop_shortperiod']) & df['positive'] & (~ df['neutral'])
+        df['SELL1_SIGNAL'] = cross_over(df['high'], df['channeltop_shortperiod']) & df['negative']
+        df['CAREFUL_SIGNAL_WEAK'] = cross_over(df['channelbot_shortperiod'], df['low']) & df['negative'] & (~ df['neutral'])
+        df['BUY2_SIGNAL'] = cross_over(df['channelbot_shortperiod'], df['low']) & df['neutral']
+        df['SELL2_SIGNAL'] = cross_over(df['high'], df['channeltop_shortperiod']) & df['neutral']
+
+        df['TEXT_BUY'] = np.where(df['BUY1_SIGNAL'] | df['BUY2_SIGNAL'], 'B', "")
+        df['TEXT_BUY_Y'] = np.where(df['BUY1_SIGNAL'] | df['BUY2_SIGNAL'], df['low'], np.nan)
+
+        df['TEXT_SELL'] = np.where(df['SELL1_SIGNAL'] | df['SELL2_SIGNAL'], 'S', "")
+        df['TEXT_SELL_Y'] = np.where(df['SELL1_SIGNAL'] | df['SELL2_SIGNAL'], df['high'], np.nan)
+
+        self.add_scatter_trace(row, col, "MA5", 0, y_arr=df["MA5"], plot_spec={"line": {"color": "#ffaec9", "width": 1, "dash": "solid"}})
+        self.add_scatter_trace(row, col, "MA10", 0, y_arr=df["MA10"], plot_spec={"line": {"color": "#d01c1f", "width": 2, "dash": "solid"}})
+        self.add_scatter_trace(row, col, "MA200", 0, y_arr=df["MA200"], plot_spec={"line": {"color": "#13ffff", "width": 4, "dash": "dot"}})
+
+        self.add_scatter_trace(row, col, "top_long", 0, y_arr=df["channeltop_longperiod"], plot_spec={"line": {"color": "#007d60", "width": 1, "dash": "solid"}})
+        self.add_scatter_trace(row, col, "bot_long", 0, y_arr=df["channelbot_longperiod"], plot_spec={"line": {"color": "#007d60", "width": 1, "dash": "solid"}})
+        self.add_scatter_trace(row, col, "top_short", 0, y_arr=df["channeltop_shortperiod"], plot_spec={"line": {"color": "#ada396", "width": 1, "dash": "dash"}})
+        self.add_scatter_trace(row, col, "bot_short", 0, y_arr=df["channelbot_shortperiod"], plot_spec={"line": {"color": "#ada396", "width": 1, "dash": "dash"}})
+
+        self.add_scatter_trace(row, col, "volMA5", 0, secondary_y=True, y_arr=df["volMA5"])
+        self.add_scatter_trace(row, col, "volMA120", 0, secondary_y=True, y_arr=df["volMA120"])
+
+        self.add_marker_trace(row, col, "TEXT_BUY", 0, x_arr=df.index, y_arr=df["TEXT_BUY_Y"], type="text", text=df["TEXT_BUY"])
+        self.add_marker_trace(row, col, "TEXT_SELL", 0, x_arr=df.index, y_arr=df["TEXT_SELL_Y"], type="text", text=df["TEXT_SELL"])
+
+        df = df.drop(columns=[col for col in df.columns if col.startswith(('MA_C_', 'TEMP_', 'WMA_', 'P1_', 'P2_', 'XMA_')) and col not in ['XA_19', 'XA_21']], errors='ignore')
+
+if __name__ == "__main__":
+    import omnifinan as of
+    from omnifinan.visualize import StockFigure
+    plotobj = DataManipulator(1, 1, 10)
+    df = of.unified_api.get_price_df("sh000001")
+    plotobj = StockFigure(1, 1, 1, width=1000, height=3000)
+    plotobj.add_candle_trace(0, 0, data_df=df, market="A")
+    plotobj.add_volume_trace(0, 0)
+    plotobj.preset_main_indicators(0,0)
+    plotobj.plotobj.create_dash(plotobj.fig, port=11733, browser_open=True)

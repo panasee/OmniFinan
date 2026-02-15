@@ -9,19 +9,36 @@ import pandas as pd
 import questionary
 from colorama import Fore, Style, init
 from dateutil.relativedelta import relativedelta
-from pyomnix.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, ModelProvider, get_model_info
-from pyomnix.utils.analysts import ANALYST_ORDER
-from pyomnix.utils.display import format_backtest_row, print_backtest_results
-from pyomnix.utils.ollama import ensure_ollama_and_model
 
-from . import (
-    get_company_news,
-    get_financial_metrics,
-    get_insider_trades,
-    get_price_df,
-    get_prices,
-)
-from .main import run_hedge_fund
+from .data.cache import DataCache
+from .data.providers.akshare_provider import AkshareProvider
+from .data.unified_service import UnifiedDataService
+from .utils.analysts import ANALYST_ORDER
+from .utils.display import format_backtest_row, print_backtest_results
+
+try:
+    from pyomnix.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, ModelProvider, get_model_info
+except Exception:  # pragma: no cover - compatibility fallback
+    class _ModelProvider:
+        OLLAMA = type("EnumValue", (), {"value": "ollama"})()
+
+    ModelProvider = _ModelProvider
+    LLM_ORDER = [("DeepSeek Chat", "deepseek-chat", "deepseek")]
+    OLLAMA_LLM_ORDER = []
+
+    def get_model_info(model_name: str):
+        class _ModelInfo:
+            provider = type("EnumValue", (), {"value": "deepseek"})()
+
+        return _ModelInfo()
+
+try:
+    from pyomnix.utils.ollama import ensure_ollama_and_model
+except Exception:  # pragma: no cover - compatibility fallback
+    def ensure_ollama_and_model(model_name: str) -> bool:  # noqa: ARG001
+        return False
+
+from .core.workflow import run_hedge_fund
 
 init(autoreset=True)
 
@@ -38,6 +55,7 @@ class Backtester:
         provider_api: str = "deepseek",
         selected_analysts: list[str] = [],
         initial_margin_requirement: float = 0.0,
+        annual_risk_free_rate: float = 0.0434,
     ):
         """
         :param agent: The trading agent (Callable).
@@ -58,6 +76,8 @@ class Backtester:
         self.model_name = model_name
         self.provider_api = provider_api
         self.selected_analysts = selected_analysts
+        self.annual_risk_free_rate = annual_risk_free_rate
+        self.data_service = UnifiedDataService(provider=AkshareProvider(), cache=DataCache())
 
         # Initialize portfolio with support for long/short positions
         self.portfolio_values = []
@@ -286,16 +306,26 @@ class Backtester:
 
         for ticker in self.tickers:
             # Fetch price data for the entire period, plus 1 year
-            get_prices(ticker, start_date_str, self.end_date)
+            self.data_service.get_prices(ticker, start_date_str, self.end_date)
 
             # Fetch financial metrics
-            get_financial_metrics(ticker, self.end_date, limit=10)
+            self.data_service.get_financial_metrics(ticker, self.end_date, limit=10)
 
             # Fetch insider trades
-            get_insider_trades(ticker, self.end_date, start_date=self.start_date, limit=1000)
+            self.data_service.get_insider_trades(
+                ticker,
+                self.end_date,
+                start_date=self.start_date,
+                limit=1000,
+            )
 
             # Fetch company news
-            get_company_news(ticker, self.end_date, start_date=self.start_date, limit=1000)
+            self.data_service.get_company_news(
+                ticker,
+                end_date=self.end_date,
+                start_date=self.start_date,
+                limit=1000,
+            )
 
         print("Data pre-fetch complete.")
 
@@ -338,12 +368,17 @@ class Backtester:
 
                 for ticker in self.tickers:
                     try:
-                        price_data = get_price_df(ticker, previous_date_str, current_date_str)
-                        if price_data.empty:
+                        price_data = self.data_service.get_prices(
+                            ticker=ticker,
+                            start_date=previous_date_str,
+                            end_date=current_date_str,
+                        )
+                        price_df = pd.DataFrame(price_data)
+                        if price_df.empty:
                             print(f"Warning: No price data for {ticker} on {current_date_str}")
                             missing_data = True
                             break
-                        current_prices[ticker] = price_data.iloc[-1]["close"]
+                        current_prices[ticker] = float(price_df.iloc[-1]["close"])
                     except Exception as e:
                         print(
                             f"Error fetching price for {ticker} between {previous_date_str} and {current_date_str}: {e}"
@@ -519,7 +554,7 @@ class Backtester:
             return  # not enough data points
 
         # Assumes 252 trading days/year
-        daily_risk_free_rate = 0.0434 / 252
+        daily_risk_free_rate = self.annual_risk_free_rate / 252
         excess_returns = clean_returns - daily_risk_free_rate
         mean_excess_return = excess_returns.mean()
         std_excess_return = excess_returns.std()
@@ -603,7 +638,7 @@ class Backtester:
 
         # Compute daily returns
         performance_df["Daily Return"] = performance_df["Portfolio Value"].pct_change().fillna(0)
-        daily_rf = 0.0434 / 252  # daily risk-free rate
+        daily_rf = self.annual_risk_free_rate / 252  # daily risk-free rate
         mean_daily_return = performance_df["Daily Return"].mean()
         std_daily_return = performance_df["Daily Return"].std()
 
@@ -703,7 +738,13 @@ if __name__ == "__main__":
         "--margin-requirement",
         type=float,
         default=0.0,
-        help="Margin ratio for short positions, e.g. 0.5 for 50% (default: 0.0)",
+        help="Margin ratio for short positions, e.g. 0.5 for 50%% (default: 0.0)",
+    )
+    parser.add_argument(
+        "--annual-risk-free-rate",
+        type=float,
+        default=0.0434,
+        help="Annual risk-free rate in decimal form (default: 0.0434)",
     )
     parser.add_argument("--ollama", action="store_true", help="Use Ollama for local LLM inference")
 
@@ -819,6 +860,7 @@ if __name__ == "__main__":
         provider_api=provider_api,
         selected_analysts=selected_analysts,
         initial_margin_requirement=args.margin_requirement,
+        annual_risk_free_rate=args.annual_risk_free_rate,
     )
 
     performance_metrics = backtester.run_backtest()

@@ -6,6 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from ..utils.llm import call_llm
+from ..utils.normalization import confidence_to_unit
 from ..utils.progress import progress
 from .state import AgentState, show_agent_reasoning
 
@@ -20,7 +21,7 @@ class PortfolioDecision(BaseModel):
     action: Literal["buy", "sell", "short", "cover", "hold"]
     quantity: int = Field(description="Number of shares to trade")
     confidence: float = Field(
-        description="Confidence in the decision, between 0.0 and 100.0"
+        description="Confidence in the decision, between 0.0 and 1.0",
     )
     reasoning: str = Field(description="Reasoning for the decision")
     agent_signals: list[AgentSignal] | None = Field(
@@ -35,6 +36,33 @@ class PortfolioManagerOutput(BaseModel):
     )
 
 
+def _sanitize_portfolio_output(output: PortfolioManagerOutput, tickers: list[str]) -> PortfolioManagerOutput:
+    allowed_actions = {"buy", "sell", "short", "cover", "hold"}
+    cleaned: dict[str, PortfolioDecision] = {}
+    for ticker in tickers:
+        decision = output.decisions.get(ticker)
+        if decision is None:
+            cleaned[ticker] = PortfolioDecision(
+                action="hold",
+                quantity=0,
+                confidence=0.0,
+                reasoning="Missing decision, defaulting to hold",
+                agent_signals=[],
+            )
+            continue
+        action = decision.action if decision.action in allowed_actions else "hold"
+        quantity = max(int(decision.quantity), 0)
+        confidence = confidence_to_unit(decision.confidence)
+        cleaned[ticker] = PortfolioDecision(
+            action=action,
+            quantity=quantity,
+            confidence=confidence,
+            reasoning=decision.reasoning,
+            agent_signals=decision.agent_signals or [],
+        )
+    return PortfolioManagerOutput(decisions=cleaned)
+
+
 ##### Portfolio Management Agent #####
 def portfolio_management_agent(state: AgentState):
     """Makes final trading decisions and generates orders for multiple tickers"""
@@ -43,6 +71,7 @@ def portfolio_management_agent(state: AgentState):
     portfolio = state["data"]["portfolio"]
     analyst_signals = state["data"]["analyst_signals"]
     tickers = state["data"]["tickers"]
+    risk_judge_decision = state["data"].get("risk_debate_state", {}).get("judge_decision", {})
 
     progress.update_status("portfolio_management_agent", None, "Analyzing signals")
 
@@ -73,7 +102,7 @@ def portfolio_management_agent(state: AgentState):
             if agent != "risk_management_agent" and ticker in signals:
                 ticker_signals[agent] = {
                     "signal": signals[ticker]["signal"],
-                    "confidence": signals[ticker]["confidence"],
+                    "confidence": confidence_to_unit(signals[ticker].get("confidence")),
                 }
         signals_by_ticker[ticker] = ticker_signals
 
@@ -91,7 +120,13 @@ def portfolio_management_agent(state: AgentState):
         model_name=state["metadata"]["model_name"],
         provider_api=state["metadata"]["provider_api"],
         language=state["metadata"].get("language", "Chinese"),
+        risk_judge_decision=risk_judge_decision,
+        temperature=state["metadata"].get("temperature"),
+        seed=state["metadata"].get("llm_seed"),
+        deterministic_mode=bool(state["metadata"].get("deterministic_mode", False)),
+        llm_max_retries=int(state["metadata"].get("llm_max_retries", 3)),
     )
+    result = _sanitize_portfolio_output(result, tickers=tickers)
 
     # Format detailed analysis reports for each ticker
     detailed_reports = {}
@@ -124,6 +159,9 @@ def portfolio_management_agent(state: AgentState):
 
     progress.update_status("portfolio_management_agent", None, "Done")
 
+    state["data"]["final_trade_decision"] = {
+        ticker: decision.model_dump() for ticker, decision in result.decisions.items()
+    }
     return state | {"messages": state["messages"] + [message], "data": state["data"]}
 
 
@@ -136,6 +174,11 @@ def generate_trading_decision(
     model_name: str,
     provider_api: str,
     language: str = "Chinese",
+    risk_judge_decision: dict | None = None,
+    temperature: float | None = None,
+    seed: int | None = None,
+    deterministic_mode: bool = False,
+    llm_max_retries: int = 3,
 ) -> PortfolioManagerOutput:
     """Attempts to get a decision from the LLM with retry logic"""
     # Create the prompt template
@@ -213,11 +256,12 @@ def generate_trading_decision(
               Current Positions: {portfolio_positions}
               Current Margin Requirement: {margin_requirement}
               Total Margin Used: {total_margin_used}
+              Risk Judge Decision: {risk_judge_decision}
 
               For each ticker, provide:
               - "action": "buy" | "sell" | "short" | "cover" | "hold"
               - "quantity": <positive integer>
-              - "confidence": <float between 0 and 100>
+              - "confidence": <float between 0 and 1>
               - "agent_signals": <list of agent signals including agent name, signal (bullish | bearish | neutral), and their confidence>
               - "reasoning": <concise explanation of the decision including how you weighted the signals>
 
@@ -227,7 +271,7 @@ def generate_trading_decision(
                   "TICKER1": {
                     "action": "buy/sell/short/cover/hold",
                     "quantity": integer,
-                    "confidence": float between 0 and 100,
+                    "confidence": float between 0 and 1,
                     "agent_signals": [
                       {"agent_name": "agent1", "signal": "bullish/bearish/neutral", "confidence": float},
                       ...
@@ -255,6 +299,7 @@ def generate_trading_decision(
             "portfolio_positions": json.dumps(portfolio.get("positions", {}), indent=2),
             "margin_requirement": f"{portfolio.get('margin_requirement', 0.5):.2f}",
             "total_margin_used": f"{portfolio.get('margin_used', 0):.2f}",
+            "risk_judge_decision": json.dumps(risk_judge_decision or {}, indent=2),
         }
     )
 
@@ -281,8 +326,12 @@ def generate_trading_decision(
         model_name=model_name,
         provider_api=provider_api,
         pydantic_model=PortfolioManagerOutput,
+        max_retries=llm_max_retries,
         agent_name="portfolio_management_agent",
         default_factory=create_default_portfolio_output,
+        temperature=temperature,
+        seed=seed,
+        deterministic_mode=deterministic_mode,
     )
 
 
@@ -331,29 +380,29 @@ def format_decision(
 
 1. 基本面分析 (权重30%):
    信号: {signal_to_chinese(fundamental_signal)}
-   置信度: {fundamental_signal["confidence"] * 100:.0f}% if fundamental_signal else "无数据"
+   置信度: {(confidence_to_unit(fundamental_signal["confidence"]) * 100):.0f}% if fundamental_signal else "无数据"
 
 2. 估值分析 (权重35%):
    信号: {signal_to_chinese(valuation_signal)}
-   置信度: {valuation_signal["confidence"] * 100:.0f}% if valuation_signal else "无数据"
+   置信度: {(confidence_to_unit(valuation_signal["confidence"]) * 100):.0f}% if valuation_signal else "无数据"
 
 3. 技术分析 (权重25%):
    信号: {signal_to_chinese(technical_signal)}
-   置信度: {technical_signal["confidence"] * 100:.0f}% if technical_signal else "无数据"
+   置信度: {(confidence_to_unit(technical_signal["confidence"]) * 100):.0f}% if technical_signal else "无数据"
 
 4. 情绪分析 (权重10%):
    信号: {signal_to_chinese(sentiment_signal)}
-   置信度: {sentiment_signal["confidence"] * 100:.0f}% if sentiment_signal else "无数据"
+   置信度: {(confidence_to_unit(sentiment_signal["confidence"]) * 100):.0f}% if sentiment_signal else "无数据"
 
 二、风险评估
 风险信号: {signal_to_chinese(risk_signal)}
-置信度: {risk_signal["confidence"] * 100:.0f}% if risk_signal else "无数据"
+置信度: {(confidence_to_unit(risk_signal["confidence"]) * 100):.0f}% if risk_signal else "无数据"
 
 三、投资建议
 操作建议: {"买入" if action == "buy" else "卖出" if action == "sell" else "做空" if action == "short" else "平仓" if action == "cover" else "持有"}
 交易数量: {quantity}股
 当前价格: {current_price:.2f}
-决策置信度: {confidence:.0f}%
+决策置信度: {(confidence_to_unit(confidence) * 100):.0f}%
 
 四、决策依据
 {reasoning}

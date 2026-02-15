@@ -25,6 +25,38 @@ class AgentState(TypedDict):
     metadata: Annotated[dict[str, Any], merge_dicts]
 
 
+def default_investment_debate_state(max_rounds: int = 1) -> dict[str, Any]:
+    return {
+        "bull_history": [],
+        "bear_history": [],
+        "judge_decision": None,
+        "count": 0,
+        "max_rounds": max_rounds,
+    }
+
+
+def default_debate_state(max_rounds: int = 1) -> dict[str, Any]:
+    return {
+        "round": 0,
+        "max_rounds": max_rounds,
+        "bull_arguments": [],
+        "bear_arguments": [],
+        "moderator_score": 0.0,
+        "risk_arguments": [],
+    }
+
+
+def default_risk_debate_state(max_rounds: int = 1) -> dict[str, Any]:
+    return {
+        "risky_history": [],
+        "safe_history": [],
+        "neutral_history": [],
+        "judge_decision": None,
+        "count": 0,
+        "max_rounds": max_rounds,
+    }
+
+
 def show_workflow_status(agent_name: str, status: str = "processing"):
     """Display agent workflow status in a clean format.
 

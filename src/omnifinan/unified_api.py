@@ -1,4 +1,4 @@
-"""
+﻿"""
 Unified API module for accessing US, HK, and Chinese stock market data using akshare.
 
 This module provides a unified interface for accessing stock market data from
@@ -21,11 +21,14 @@ from typing import Any, Literal  # Added Any for flexibility with model fields
 
 import akshare as ak
 import pandas as pd
+import requests
 from pyomnix.consts import OMNIX_PATH
 
 # Assuming omnix_logger and data_models are in the same package structure
 # If not, adjust the import paths accordingly
 from pyomnix.omnix_logger import get_logger
+
+from .utils.holidays import filter_trading_days
 
 # Import data models (assuming they are defined correctly AND reflect the original structure)
 from .data_models import (
@@ -37,8 +40,7 @@ from .data_models import (
     Price,
 )
 
-# 获取当前模块的路径
-
+# 鑾峰彇褰撳墠妯″潡鐨勮矾寰?
 # Setup logging
 logger = get_logger("unified_api")
 
@@ -149,7 +151,7 @@ def _format_date(date_str: str | None, default_delta_days: int = 0) -> str:
 
 
 def _format_output_date(date_input) -> str | None:
-    """Converts various date inputs to 'YYYY-MM-DD' string, returning None on failure."""
+    """Converts date-like input to output string. Keeps time for intraday values."""
     if pd.isna(date_input):
         return None
     if isinstance(date_input, str):
@@ -157,13 +159,19 @@ def _format_output_date(date_input) -> str | None:
             # Handle YYYYMMDD
             if len(date_input) == 8 and date_input.isdigit():
                 return datetime.strptime(date_input, "%Y%m%d").strftime("%Y-%m-%d")
-            # Handle other common formats parsable by pandas
-            return pd.to_datetime(date_input).strftime("%Y-%m-%d")
+            parsed = pd.to_datetime(date_input)
+            if parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0:
+                return parsed.strftime("%Y-%m-%d")
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             logger.debug(f"Could not parse date string: {date_input}")
             return date_input  # Return original string if parsing fails as a fallback? Or None? Let's return None for consistency.
             # return None
     elif isinstance(date_input, (date, pd.Timestamp)):
+        if isinstance(date_input, pd.Timestamp):
+            if date_input.hour == 0 and date_input.minute == 0 and date_input.second == 0:
+                return date_input.strftime("%Y-%m-%d")
+            return date_input.strftime("%Y-%m-%d %H:%M:%S")
         return date_input.strftime("%Y-%m-%d")
     logger.debug(f"Could not format date input (type {type(date_input)}): {date_input}")
     return None  # Fallback
@@ -176,6 +184,511 @@ def _get_value_from_row(row: pd.Series, key: str, converter: callable, default=N
     return default
 
 
+def _infer_date_and_value_columns(df: pd.DataFrame) -> tuple[str | None, str | None]:
+    """Infer date and numeric value columns for noisy macro datasets."""
+    if df is None or df.empty:
+        return None, None
+    date_col = None
+    value_col = None
+    best_date_count = -1
+    best_value_count = -1
+
+    for col in df.columns:
+        parsed_dates = pd.to_datetime(df[col], errors="coerce")
+        date_count = int(parsed_dates.notna().sum())
+        if date_count > best_date_count:
+            best_date_count = date_count
+            date_col = col
+
+        parsed_numbers = pd.to_numeric(df[col], errors="coerce")
+        value_count = int(parsed_numbers.notna().sum())
+        if value_count > best_value_count:
+            best_value_count = value_count
+            value_col = col
+
+    if best_date_count <= 0:
+        date_col = None
+    if best_value_count <= 0:
+        value_col = None
+    return date_col, value_col
+
+
+def _normalize_macro_series(
+    df: pd.DataFrame,
+    *,
+    series_name: str,
+    source: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    date_col: str | None = None,
+    value_col: str | None = None,
+) -> dict[str, Any]:
+    """Normalize raw macro dataframe into a stable date-value series payload."""
+    if df is None or df.empty:
+        return {
+            "series": series_name,
+            "source": source,
+            "observations": [],
+            "latest": None,
+            "previous": None,
+            "trend": "flat",
+            "error": "empty dataframe",
+        }
+
+    local_date_col, local_value_col = _infer_date_and_value_columns(df)
+    use_date_col = date_col or local_date_col
+    use_value_col = value_col or local_value_col
+    if use_date_col is None or use_value_col is None:
+        return {
+            "series": series_name,
+            "source": source,
+            "observations": [],
+            "latest": None,
+            "previous": None,
+            "trend": "flat",
+            "error": "could not infer date/value columns",
+        }
+
+    work = df[[use_date_col, use_value_col]].copy()
+    work.columns = ["date", "value"]
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["value"] = pd.to_numeric(work["value"], errors="coerce")
+    work = work.dropna(subset=["date", "value"]).sort_values("date")
+
+    if start_date:
+        start_dt = pd.to_datetime(start_date, errors="coerce")
+        if pd.notna(start_dt):
+            work = work[work["date"] >= start_dt]
+    if end_date:
+        end_dt = pd.to_datetime(end_date, errors="coerce")
+        if pd.notna(end_dt):
+            work = work[work["date"] <= end_dt]
+
+    observations = [
+        {"date": ts.strftime("%Y-%m-%d"), "value": float(val)}
+        for ts, val in zip(work["date"], work["value"], strict=False)
+    ]
+    latest = observations[-1] if observations else None
+    previous = observations[-2] if len(observations) > 1 else None
+    trend = "flat"
+    if latest and previous:
+        if latest["value"] > previous["value"]:
+            trend = "up"
+        elif latest["value"] < previous["value"]:
+            trend = "down"
+
+    return {
+        "series": series_name,
+        "source": source,
+        "observations": observations,
+        "latest": latest,
+        "previous": previous,
+        "trend": trend,
+        "error": None,
+    }
+
+
+def _fetch_sofr_series(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Fetch SOFR from New York Fed public endpoint."""
+    start = start_date or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    end = end_date or datetime.now().strftime("%Y-%m-%d")
+    url = (
+        "https://markets.newyorkfed.org/api/rates/secured/sofr/search.json"
+        f"?startDate={start}&endDate={end}&type=rate"
+    )
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("refRates", [])
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {
+                "series": "sofr",
+                "source": "nyfed",
+                "observations": [],
+                "latest": None,
+                "previous": None,
+                "trend": "flat",
+                "error": "empty SOFR response",
+            }
+        return _normalize_macro_series(
+            df,
+            series_name="sofr",
+            source="nyfed",
+            start_date=start_date,
+            end_date=end_date,
+            date_col="effectiveDate",
+            value_col="percentRate",
+        )
+    except Exception as exc:
+        logger.warning("SOFR fetch failed: %s", exc)
+        return {
+            "series": "sofr",
+            "source": "nyfed",
+            "observations": [],
+            "latest": None,
+            "previous": None,
+            "trend": "flat",
+            "error": str(exc),
+        }
+
+
+def get_macro_indicators(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Fetch major macro indicators used in top-down financial analysis.
+
+    Indicator coverage (when available from current AkShare version):
+    - Policy/liquidity: Fed policy rate, PBOC policy rate, China LPR, China SHIBOR 3M, SOFR
+    - Inflation: US CPI YoY, US core PCE, China CPI YoY, China PPI YoY
+    - Growth/activity: US GDP, US ISM PMI, US retail sales, China GDP YoY, China PMI (manufacturing/non-manufacturing)
+    - Labor: US unemployment, US non-farm payrolls, US initial jobless claims, China urban unemployment
+    - External/credit: China M2 YoY, exports YoY, imports YoY, trade balance, FX reserves
+    """
+    results: dict[str, Any] = {"series": {}}
+    fetch_specs = {
+        # US policy + inflation + activity + labor
+        "fed_policy_rate": {"source": "akshare", "fetcher_name": "macro_bank_usa_interest_rate"},
+        "us_cpi_yoy": {"source": "akshare", "fetcher_name": "macro_usa_cpi_yoy"},
+        "us_core_pce_price": {"source": "akshare", "fetcher_name": "macro_usa_core_pce_price"},
+        "us_unemployment_rate": {"source": "akshare", "fetcher_name": "macro_usa_unemployment_rate"},
+        "us_non_farm_payrolls": {"source": "akshare", "fetcher_name": "macro_usa_non_farm"},
+        "us_initial_jobless_claims": {"source": "akshare", "fetcher_name": "macro_usa_initial_jobless"},
+        "us_ism_pmi": {"source": "akshare", "fetcher_name": "macro_usa_ism_pmi"},
+        "us_retail_sales": {"source": "akshare", "fetcher_name": "macro_usa_retail_sales"},
+        "us_gdp_growth": {"source": "akshare", "fetcher_name": "macro_usa_gdp_monthly"},
+        "us_industrial_production": {"source": "akshare", "fetcher_name": "macro_usa_industrial_production"},
+        # China policy + inflation + activity + labor + external
+        "pboc_policy_rate": {"source": "akshare", "fetcher_name": "macro_bank_china_interest_rate"},
+        "china_lpr_1y": {
+            "source": "akshare",
+            "fetcher_name": "macro_china_lpr",
+            "date_col": "TRADE_DATE",
+            "value_col": "LPR1Y",
+        },
+        "china_shibor_3m": {"source": "akshare", "fetcher_name": "macro_china_shibor_all"},
+        "china_cpi_yoy": {"source": "akshare", "fetcher_name": "macro_china_cpi_yearly"},
+        "china_ppi_yoy": {"source": "akshare", "fetcher_name": "macro_china_ppi_yearly"},
+        "china_gdp_yoy": {"source": "akshare", "fetcher_name": "macro_china_gdp_yearly"},
+        "china_pmi_manufacturing": {"source": "akshare", "fetcher_name": "macro_china_pmi_yearly"},
+        "china_pmi_non_manufacturing": {"source": "akshare", "fetcher_name": "macro_china_non_man_pmi"},
+        "china_urban_unemployment": {"source": "akshare", "fetcher_name": "macro_china_urban_unemployment"},
+        "china_m2_yoy": {"source": "akshare", "fetcher_name": "macro_china_m2_yearly"},
+        "china_exports_yoy": {"source": "akshare", "fetcher_name": "macro_china_exports_yoy"},
+        "china_imports_yoy": {"source": "akshare", "fetcher_name": "macro_china_imports_yoy"},
+        "china_trade_balance": {"source": "akshare", "fetcher_name": "macro_china_trade_balance"},
+        "china_fx_reserves": {"source": "akshare", "fetcher_name": "macro_china_fx_reserves_yearly"},
+    }
+
+    for key, spec in fetch_specs.items():
+        source = str(spec.get("source", "akshare"))
+        fetcher_name = str(spec.get("fetcher_name", ""))
+        fetcher = getattr(ak, fetcher_name, None)
+        if fetcher is None:
+            results["series"][key] = {
+                "series": key,
+                "source": source,
+                "observations": [],
+                "latest": None,
+                "previous": None,
+                "trend": "flat",
+                "error": f"akshare fetcher unavailable: {fetcher_name}",
+            }
+            continue
+
+        try:
+            df = fetcher()
+            if key == "china_shibor_3m":
+                date_col = next(
+                    (
+                        col
+                        for col in df.columns
+                        if str(col).upper() in {"DATE", "日期", "TRADE_DATE"}
+                    ),
+                    None,
+                )
+                value_col = next(
+                    (
+                        col
+                        for col in df.columns
+                        if "3M" in str(col).upper()
+                    ),
+                    None,
+                )
+                series_payload = _normalize_macro_series(
+                    df,
+                    series_name=key,
+                    source=source,
+                    start_date=start_date,
+                    end_date=end_date,
+                    date_col=date_col,
+                    value_col=value_col,
+                )
+            else:
+                series_payload = _normalize_macro_series(
+                    df,
+                    series_name=key,
+                    source=source,
+                    start_date=start_date,
+                    end_date=end_date,
+                    date_col=spec.get("date_col"),
+                    value_col=spec.get("value_col"),
+                )
+        except Exception as exc:
+            logger.warning("Macro fetch failed for %s via %s: %s", key, fetcher_name, exc)
+            series_payload = {
+                "series": key,
+                "source": source,
+                "observations": [],
+                "latest": None,
+                "previous": None,
+                "trend": "flat",
+                "error": str(exc),
+            }
+        results["series"][key] = series_payload
+
+    results["series"]["sofr"] = _fetch_sofr_series(start_date=start_date, end_date=end_date)
+    results["snapshot_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    results["latest"] = {
+        key: val.get("latest", {}).get("value") if isinstance(val, dict) and val.get("latest") else None
+        for key, val in results["series"].items()
+    }
+    return results
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    """Heuristic crypto symbol detection for holiday filtering bypass."""
+    upper = symbol.upper()
+    if "/" in upper or "-" in upper:
+        return True
+    quote_suffixes = ("USDT", "USDC", "BUSD", "BTC", "ETH")
+    return any(upper.endswith(suffix) for suffix in quote_suffixes)
+
+
+def _holiday_filter_market_code(market: MarketType, normalized_ticker: str) -> str | None:
+    """Map MarketType to holiday filter market code used by utils.holidays."""
+    if market == MarketType.US:
+        return "US"
+    if market == MarketType.HK:
+        return "HK"
+    if market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ, MarketType.CHINA]:
+        return "A"
+    if _is_crypto_symbol(normalized_ticker):
+        # Crypto trades 24/7, do not remove weekend/holiday rows.
+        return "NA"
+    return None
+
+
+def _apply_price_date_and_holiday_filters(
+    df: pd.DataFrame,
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    market: MarketType,
+    normalized_ticker: str,
+) -> pd.DataFrame:
+    """Apply date-range clipping and market holiday filtering to fetched prices."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "date" not in df.columns:
+        return df
+
+    filtered = df.copy()
+    filtered["date"] = pd.to_datetime(filtered["date"], errors="coerce")
+    filtered = filtered.dropna(subset=["date"])
+    if filtered.empty:
+        return filtered
+
+    if start_date:
+        start_dt = pd.to_datetime(start_date, errors="coerce")
+        if pd.notna(start_dt):
+            filtered = filtered[filtered["date"] >= start_dt]
+    if end_date:
+        end_dt = pd.to_datetime(end_date, errors="coerce")
+        if pd.notna(end_dt):
+            filtered = filtered[filtered["date"] <= end_dt]
+
+    market_code = _holiday_filter_market_code(market, normalized_ticker)
+    if market_code:
+        try:
+            calendar_input = filtered.rename(columns={"date": "time"})
+            calendar_filtered = filter_trading_days(calendar_input, market=market_code)
+            filtered = (
+                calendar_filtered.rename(columns={"time": "date"})
+                if "time" in calendar_filtered.columns
+                else calendar_filtered
+            )
+        except Exception as holiday_error:
+            logger.warning(
+                "Holiday filter skipped for %s (%s): %s",
+                normalized_ticker,
+                market.name,
+                holiday_error,
+            )
+            if "date" not in filtered.columns and "time" in filtered.columns:
+                filtered = filtered.rename(columns={"time": "date"})
+    if "date" in filtered.columns:
+        return filtered.sort_values("date").reset_index(drop=True)
+    return filtered.reset_index(drop=True)
+
+
+def _normalize_interval(interval: str) -> str:
+    normalized = str(interval or "1d").lower().strip()
+    allowed = {"1d", "1m", "3m", "5m", "15m", "30m", "60m"}
+    if normalized not in allowed:
+        logger.warning("Unsupported interval '%s', fallback to '1d'.", interval)
+        return "1d"
+    return normalized
+
+
+def _format_minute_datetime(date_str: str | None, default_dt: datetime) -> str:
+    if not date_str:
+        return default_dt.strftime("%Y-%m-%d %H:%M:%S")
+    parsed = pd.to_datetime(date_str, errors="coerce")
+    if pd.isna(parsed):
+        return default_dt.strftime("%Y-%m-%d %H:%M:%S")
+    if parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0:
+        return parsed.strftime("%Y-%m-%d 00:00:00")
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_us_minute_symbol(symbol: str) -> str:
+    # AkShare EastMoney US minute endpoint expects "105.MSFT" style symbols.
+    if re.fullmatch(r"^\d+\.[A-Z\.]+$", symbol):
+        return symbol
+    return f"105.{symbol}"
+
+
+def _standardize_price_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    cols = list(work.columns)
+    lower_map = {str(col).lower(): col for col in cols}
+
+    rename_map: dict[str, str] = {}
+    if "date" in lower_map:
+        rename_map[lower_map["date"]] = "date"
+    elif "time" in lower_map:
+        rename_map[lower_map["time"]] = "date"
+    elif "datetime" in lower_map:
+        rename_map[lower_map["datetime"]] = "date"
+
+    if "open" in lower_map:
+        rename_map[lower_map["open"]] = "open"
+    if "close" in lower_map:
+        rename_map[lower_map["close"]] = "close"
+    if "high" in lower_map:
+        rename_map[lower_map["high"]] = "high"
+    if "low" in lower_map:
+        rename_map[lower_map["low"]] = "low"
+    if "volume" in lower_map:
+        rename_map[lower_map["volume"]] = "volume"
+    if "amount" in lower_map:
+        rename_map[lower_map["amount"]] = "amount"
+
+    work = work.rename(columns=rename_map)
+
+    # Fallback for minute datasets where columns may be non-English:
+    # [date, open, close, high, low, volume, amount, ...]
+    col_names = list(work.columns)
+    if "date" not in work.columns and len(col_names) >= 1:
+        work = work.rename(columns={col_names[0]: "date"})
+        col_names = list(work.columns)
+    if "open" not in work.columns and len(col_names) >= 2:
+        work = work.rename(columns={col_names[1]: "open"})
+        col_names = list(work.columns)
+    if "close" not in work.columns and len(col_names) >= 3:
+        work = work.rename(columns={col_names[2]: "close"})
+        col_names = list(work.columns)
+    if "high" not in work.columns and len(col_names) >= 4:
+        work = work.rename(columns={col_names[3]: "high"})
+        col_names = list(work.columns)
+    if "low" not in work.columns and len(col_names) >= 5:
+        work = work.rename(columns={col_names[4]: "low"})
+        col_names = list(work.columns)
+    if "volume" not in work.columns and len(col_names) >= 6:
+        work = work.rename(columns={col_names[5]: "volume"})
+        col_names = list(work.columns)
+    if "amount" not in work.columns and len(col_names) >= 7:
+        work = work.rename(columns={col_names[6]: "amount"})
+
+    return work
+
+
+def _resample_intraday_prices(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.dropna(subset=["date"]).sort_values("date")
+    if work.empty:
+        return pd.DataFrame()
+
+    for numeric_col in ("open", "high", "low", "close", "volume", "amount"):
+        if numeric_col in work.columns:
+            work[numeric_col] = pd.to_numeric(work[numeric_col], errors="coerce")
+
+    agg_map: dict[str, str] = {}
+    if "open" in work.columns:
+        agg_map["open"] = "first"
+    if "high" in work.columns:
+        agg_map["high"] = "max"
+    if "low" in work.columns:
+        agg_map["low"] = "min"
+    if "close" in work.columns:
+        agg_map["close"] = "last"
+    if "volume" in work.columns:
+        agg_map["volume"] = "sum"
+    if "amount" in work.columns:
+        agg_map["amount"] = "sum"
+
+    if not agg_map:
+        return work
+
+    rs = work.set_index("date").resample(rule).agg(agg_map).dropna(subset=["open", "high", "low", "close"])
+    rs = rs.reset_index()
+    rs["date"] = rs["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return rs
+
+
+def _finalize_price_volume_and_amount(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and auto-complete `volume` (鎴愪氦閲? and `amount` (鎴愪氦棰?."""
+    if df is None or df.empty:
+        return df
+
+    work = df.copy()
+    for col in ("close", "volume", "amount"):
+        if col not in work.columns:
+            work[col] = pd.NA
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    close = work["close"]
+    volume = work["volume"]
+    amount = work["amount"]
+
+    # If amount is missing but volume is present, estimate鎴愪氦棰?by close * volume.
+    amount_fill_mask = amount.isna() & volume.notna() & close.notna()
+    work.loc[amount_fill_mask, "amount"] = volume[amount_fill_mask] * close[amount_fill_mask]
+
+    # If volume is missing but amount is present, infer鎴愪氦閲?by amount / close.
+    volume_fill_mask = volume.isna() & amount.notna() & close.notna() & (close != 0)
+    work.loc[volume_fill_mask, "volume"] = amount[volume_fill_mask] / close[volume_fill_mask]
+
+    # Price model expects int volume; keep 0 when still missing after completion.
+    work["volume"] = pd.to_numeric(work["volume"], errors="coerce").fillna(0)
+    work["volume"] = work["volume"].clip(lower=0).round().astype("int64")
+
+    # amount remains nullable float.
+    work["amount"] = pd.to_numeric(work["amount"], errors="coerce")
+    return work
+
+
 # --- Unified API Functions ---
 
 
@@ -183,26 +696,41 @@ def get_prices(
     ticker: str,
     start_date: str | None = None,
     end_date: str | None = None,
+    interval: Literal["1d", "1m", "3m", "5m", "15m", "30m", "60m"] = "1d",
     adjustment: Literal["qfq", "hfq", ""] = "",
     api: Literal["sina", "em"] = "sina",
+    provider: Literal["akshare", "finnhub", "yfinance"] = "akshare",
 ) -> list[Price]:
     """
     Fetch price data compatible with the original Price model structure.
-    Includes fields like amount, amplitude, turnover, setting them to None if
-    unavailable for the market (e.g., US).
 
     Args:
         ticker: The ticker symbol (e.g., "AAPL", "00700", "600519")
         start_date: Start date in "YYYY-MM-DD" format. Defaults to 1 year ago.
         end_date: End date in "YYYY-MM-DD" format. Defaults to yesterday.
-        adjustment: Price adjustment type. "qfq" for 前复权, "hfq" for 后复权, "" for no adjustment.
-        api: Data source, "sina" for Sina, "em" for East Money.
+        interval: K-line interval. Supports "1d", "1m", "3m", "5m", "15m", "30m", "60m".
+        adjustment: Price adjustment type.
+        api: Data source for daily bars, "sina" or "em".
 
     Returns:
         List[Price]: A list of price data objects matching the original structure.
     """
+    if provider != "akshare":
+        from .data.providers.factory import create_data_provider
+
+        external_provider = create_data_provider(provider)
+        return external_provider.get_prices(
+            ticker=ticker,
+            start_date=start_date,
+            end_date=end_date,
+            interval=interval,
+        )
+
     normalized_ticker = normalize_ticker(ticker)
     market = detect_market(normalized_ticker)
+    interval = _normalize_interval(interval)
+    intraday = interval != "1d"
+
     if normalized_ticker == "SH000001":
         normalized_ticker = "000001"
 
@@ -215,54 +743,101 @@ def get_prices(
         start_date_ak = start_dt.strftime("%Y%m%d")
 
     logger.info(
-        f"Getting price history for {normalized_ticker} ({market.name}) from {start_date_ak} to {end_date_ak}"
+        "Getting price history for %s (%s), interval=%s, from %s to %s",
+        normalized_ticker,
+        market.name,
+        interval,
+        start_date_ak,
+        end_date_ak,
     )
 
-    prices_list = []
+    prices_list: list[Price] = []
     try:
         df = pd.DataFrame()
-        if api == "sina":
-            if market == MarketType.US:
-                # For US stocks, use stock_us_daily function which is more reliable
-                df = ak.stock_us_daily(
-                    symbol=normalized_ticker,
-                    adjust=adjustment,
-                )
 
-            elif market == MarketType.HK:
-                # For HK stocks
-                df = ak.stock_hk_daily(
-                    symbol=normalized_ticker,
-                    adjust=adjustment,
+        if intraday:
+            minute_period = "1" if interval == "3m" else interval.replace("m", "")
+            minute_start = _format_minute_datetime(
+                start_date,
+                default_dt=datetime.now() - timedelta(days=7),
+            )
+            minute_end = _format_minute_datetime(
+                end_date,
+                default_dt=datetime.now(),
+            )
+
+            if market == MarketType.US:
+                # AkShare US minute endpoint usually provides the most recent few sessions.
+                df = ak.stock_us_hist_min_em(
+                    symbol=_to_us_minute_symbol(normalized_ticker),
+                    start_date=minute_start,
+                    end_date=minute_end,
                 )
-            elif market in [
-                MarketType.CHINA_SZ,
-                MarketType.CHINA_SH,
-                MarketType.CHINA_BJ,
-            ]:
+            elif market == MarketType.HK:
+                try:
+                    df = ak.stock_hk_hist_min_em(
+                        symbol=normalized_ticker,
+                        period=minute_period,
+                        start_date=minute_start,
+                        end_date=minute_end,
+                        adjust=adjustment,
+                    )
+                except TypeError:
+                    df = ak.stock_hk_hist_min_em(
+                        symbol=normalized_ticker,
+                        period=minute_period,
+                        start_date=minute_start,
+                        end_date=minute_end,
+                    )
+            elif market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]:
+                try:
+                    df = ak.stock_zh_a_hist_min_em(
+                        symbol=normalized_ticker,
+                        period=minute_period,
+                        start_date=minute_start,
+                        end_date=minute_end,
+                        adjust=adjustment,
+                    )
+                except TypeError:
+                    df = ak.stock_zh_a_hist_min_em(
+                        symbol=normalized_ticker,
+                        period=minute_period,
+                        start_date=minute_start,
+                        end_date=minute_end,
+                    )
+            else:
+                logger.warning("Intraday not supported for market: %s", market.name)
+                return []
+
+            df = _standardize_price_columns(df)
+            resample_rule_map = {
+                "3m": "3min",
+                "5m": "5min",
+                "15m": "15min",
+                "30m": "30min",
+                "60m": "60min",
+            }
+            # US endpoint returns 1-minute bars; resample for requested higher intervals.
+            # Also resample 3-minute bars for all markets because there is no direct 3m endpoint.
+            if interval in resample_rule_map and (market == MarketType.US or interval == "3m"):
+                df = _resample_intraday_prices(df, rule=resample_rule_map[interval])
+
+        elif api == "sina":
+            if market == MarketType.US:
+                df = ak.stock_us_daily(symbol=normalized_ticker, adjust=adjustment)
+            elif market == MarketType.HK:
+                df = ak.stock_hk_daily(symbol=normalized_ticker, adjust=adjustment)
+            elif market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]:
                 df = ak.stock_zh_a_daily(
                     symbol=f"{market.value}{normalized_ticker}",
                     start_date=start_date_ak,
                     end_date=end_date_ak,
                     adjust=adjustment,
                 )
-            # Rename columns to match our expected format
-            df = df.rename(
-                columns={
-                    "date": "date",
-                    "open": "open",
-                    "high": "high",
-                    "low": "low",
-                    "close": "close",
-                    "volume": "volume",
-                }
-            )
-            logger.info(f"Successfully fetched stock data for {normalized_ticker}")
+            df = _standardize_price_columns(df)
+
         elif api == "em":
             if market == MarketType.US:
-                logger.warning(
-                    "api for em of us stocks are broken now, check new version of akshare"
-                )
                 df = ak.stock_us_hist(
                     symbol=normalized_ticker,
                     period="daily",
@@ -278,8 +853,7 @@ def get_prices(
                     end_date=end_date_ak,
                     adjust=adjustment,
                 )
-            else:  # MarketType.CHINA
-                # For Chinese A-shares
+            else:
                 df = ak.stock_zh_a_hist(
                     symbol=normalized_ticker,
                     period="daily",
@@ -287,29 +861,31 @@ def get_prices(
                     end_date=end_date_ak,
                     adjust=adjustment,
                 )
-            # Rename essential US columns - others will be None
-            df = df.rename(
-                columns={
-                    "日期": "date",
-                    "开盘": "open",
-                    "收盘": "close",
-                    "最高": "high",
-                    "最低": "low",
-                    "成交量": "volume",
-                    "成交额": "amount",
-                    "振幅": "amplitude",
-                    "涨跌幅": "pct_change",
-                    "涨跌额": "change_amount",
-                    "换手率": "turnover",
-                }
-            )
-            logger.info(f"Successfully fetched stock data for {normalized_ticker}")
+            df = _standardize_price_columns(df)
 
         if df is None or df.empty:
-            logger.warning(f"No price data found for {normalized_ticker} in the specified range.")
+            logger.warning("No price data found for %s in the specified range.", normalized_ticker)
             return []
 
-        # Add missing columns that might be expected in the Price model
+        filter_start = start_date
+        filter_end = end_date
+        if intraday:
+            if filter_start and len(str(filter_start)) <= 10:
+                filter_start = f"{filter_start} 00:00:00"
+            if filter_end and len(str(filter_end)) <= 10:
+                filter_end = f"{filter_end} 23:59:59"
+
+        df = _apply_price_date_and_holiday_filters(
+            df,
+            start_date=filter_start,
+            end_date=filter_end,
+            market=market,
+            normalized_ticker=normalized_ticker,
+        )
+        if df.empty:
+            logger.warning("No price data left after filtering for %s", normalized_ticker)
+            return []
+
         if "amount" not in df.columns:
             df["amount"] = None
         if "amplitude" not in df.columns:
@@ -321,30 +897,27 @@ def get_prices(
         if "turnover" not in df.columns:
             df["turnover"] = None
 
-        # Convert DataFrame to Price objects, ensuring all model fields exist (as None if needed)
-        for _, row in df.iterrows():
-            # Use _get_value_from_row for safe extraction and conversion
-            price_data = Price(
-                open=_get_value_from_row(row, "open", _safe_float_convert),
-                high=_get_value_from_row(row, "high", _safe_float_convert),
-                low=_get_value_from_row(row, "low", _safe_float_convert),
-                close=_get_value_from_row(row, "close", _safe_float_convert),
-                volume=_get_value_from_row(row, "volume", _safe_int_convert),
-                time=_get_value_from_row(row, "date", _format_output_date),  # Format date string
-                # Fields potentially missing in US/HK data:
-                amount=_get_value_from_row(row, "amount", _safe_float_convert),
-                amplitude=_get_value_from_row(row, "amplitude", _safe_float_convert),
-                pct_change=_get_value_from_row(row, "pct_change", _safe_float_convert),
-                change_amount=_get_value_from_row(row, "change_amount", _safe_float_convert),
-                turnover=_get_value_from_row(row, "turnover", _safe_float_convert),
-                # Market field
-                market=market,
-            )
-            prices_list.append(price_data)
+        df = _finalize_price_volume_and_amount(df)
 
-        logger.info(
-            f"Successfully fetched {len(prices_list)} price records for {normalized_ticker}"
-        )
+        for _, row in df.iterrows():
+            prices_list.append(
+                Price(
+                    open=_get_value_from_row(row, "open", _safe_float_convert),
+                    high=_get_value_from_row(row, "high", _safe_float_convert),
+                    low=_get_value_from_row(row, "low", _safe_float_convert),
+                    close=_get_value_from_row(row, "close", _safe_float_convert),
+                    volume=_get_value_from_row(row, "volume", _safe_int_convert),
+                    time=_get_value_from_row(row, "date", _format_output_date),
+                    amount=_get_value_from_row(row, "amount", _safe_float_convert),
+                    amplitude=_get_value_from_row(row, "amplitude", _safe_float_convert),
+                    pct_change=_get_value_from_row(row, "pct_change", _safe_float_convert),
+                    change_amount=_get_value_from_row(row, "change_amount", _safe_float_convert),
+                    turnover=_get_value_from_row(row, "turnover", _safe_float_convert),
+                    market=market,
+                )
+            )
+
+        logger.info("Successfully fetched %s price records for %s", len(prices_list), normalized_ticker)
 
     except Exception as e:
         logger.error(f"Error getting price history for {normalized_ticker}: {e}", exc_info=True)
@@ -468,15 +1041,15 @@ def get_financial_metrics(
                 total_shares = None
                 try:
                     info_df = ak.stock_individual_info_em(symbol=normalized_ticker, timeout=20)
-                    total_shares_series = info_df[info_df["item"] == "总股本"]["value"]
+                    total_shares_series = info_df[
+                        info_df["item"].astype(str).str.contains("总股本|股本", regex=True, na=False)
+                    ]["value"]
                     if not total_shares_series.empty:
                         value_str = total_shares_series.iloc[0]
                         num_part_list = re.findall(r"[\d\.]+", value_str)
                         if num_part_list:
                             num_part = num_part_list[0]
-                            multiplier = (
-                                1e8 if "亿" in value_str else 1e4 if "万" in value_str else 1
-                            )
+                            multiplier = 1e8 if "亿" in value_str else 1e4 if "万" in value_str else 1
                             total_shares = float(num_part) * multiplier
                 except Exception as e_info:
                     logger.warning(
@@ -493,8 +1066,8 @@ def get_financial_metrics(
                         symbol=normalized_ticker, start_year=str(current_year - 1)
                     )
                     if not ind_df.empty:
-                        ind_df["日期"] = pd.to_datetime(ind_df["日期"])
-                        indicator_data = ind_df.sort_values("日期", ascending=False).iloc[0]
+                        ind_df["鏃ユ湡"] = pd.to_datetime(ind_df["鏃ユ湡"])
+                        indicator_data = ind_df.sort_values("鏃ユ湡", ascending=False).iloc[0]
                 except Exception as e_ind:
                     logger.warning(
                         f"Failed fetching CN financial indicators for {normalized_ticker}: {e_ind}"
@@ -517,7 +1090,7 @@ def get_financial_metrics(
                 )
             elif not indicator_data.empty:  # CN from indicators
                 metric_data["price_to_earnings_ratio"] = _safe_float_convert(
-                    indicator_data.get("市盈率PE(TTM)")
+                    indicator_data.get("甯傜泩鐜嘝E(TTM)")
                 )
 
             # PB Ratio (Only available from CN indicators in this setup)
@@ -526,7 +1099,7 @@ def get_financial_metrics(
                 and not indicator_data.empty
             ):
                 metric_data["price_to_book_ratio"] = _safe_float_convert(
-                    indicator_data.get("市净率PB(MRQ)")
+                    indicator_data.get("甯傚噣鐜嘝B(MRQ)")
                 )
 
             # Update report_period if CN indicators provided a date
@@ -534,7 +1107,7 @@ def get_financial_metrics(
                 market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]
                 and not indicator_data.empty
             ):
-                indicator_date = _format_output_date(indicator_data.get("日期"))
+                indicator_date = _format_output_date(indicator_data.get("鏃ユ湡"))
                 if indicator_date:
                     metric_data["report_period"] = indicator_date
 
@@ -555,21 +1128,21 @@ def get_financial_metrics(
                         return default
 
                 metric_data["return_on_equity"] = _parse_indicator(
-                    "净资产收益率ROE(加权)", is_percent=True
+                    "鍑€璧勪骇鏀剁泭鐜嘡OE(鍔犳潈)", is_percent=True
                 )
-                metric_data["net_margin"] = _parse_indicator("销售净利率(%)", is_percent=True)
-                metric_data["operating_margin"] = _parse_indicator("营业利润率(%)", is_percent=True)
+                metric_data["net_margin"] = _parse_indicator("閿€鍞噣鍒╃巼(%)", is_percent=True)
+                metric_data["operating_margin"] = _parse_indicator("钀ヤ笟鍒╂鼎鐜?%)", is_percent=True)
                 metric_data["revenue_growth"] = _parse_indicator(
-                    "主营业务收入增长率(%)", is_percent=True
+                    "涓昏惀涓氬姟鏀跺叆澧為暱鐜?%)", is_percent=True
                 )
                 metric_data["earnings_growth"] = _parse_indicator(
-                    "净利润增长率(%)", is_percent=True
+                    "鍑€鍒╂鼎澧為暱鐜?%)", is_percent=True
                 )
-                metric_data["current_ratio"] = _parse_indicator("流动比率")
+                metric_data["current_ratio"] = _parse_indicator("娴佸姩姣旂巼")
                 metric_data["debt_to_equity"] = _parse_indicator(
-                    "资产负债率(%)", is_percent=True
+                    "璧勪骇璐熷€虹巼(%)", is_percent=True
                 )  # Note: D/A ratio
-                metric_data["earnings_per_share"] = _parse_indicator("基本每股收益(元)")
+                metric_data["earnings_per_share"] = _parse_indicator("鍩烘湰姣忚偂鏀剁泭(鍏?")
                 # book_value_growth, price_to_sales_ratio, free_cash_flow_per_share remain None
 
             # Log if detailed metrics are missing for US/HK
@@ -583,9 +1156,10 @@ def get_financial_metrics(
                 exc_info=True,
             )
 
-    metrics_list = FinancialMetrics(**metric_data)
-
-    return metrics_list
+    metrics = FinancialMetrics(**metric_data)
+    # Keep return type stable for all callers and support historical `limit` usage.
+    # Current data source yields one snapshot, so we return a single-item list.
+    return [metrics]
 
 
 def search_line_items(
@@ -736,43 +1310,38 @@ def search_line_items(
                 "USD" if market == MarketType.US else "HKD" if market == MarketType.HK else "CNY"
             )
 
-            # Base items (handle potential missing rows)
-            ni = _get_value_from_row(
-                income_row, "净利润", _safe_float_convert
-            )  # Or "归属于母公司所有者的净利润"
-            if ni is None:
-                ni = _get_value_from_row(income_row, "股东应占溢利", _safe_float_convert)
-            rev = _get_value_from_row(income_row, "营业总收入", _safe_float_convert)
-            if rev is None:
-                rev = _get_value_from_row(income_row, "营运收入", _safe_float_convert)
-            op = _get_value_from_row(income_row, "营业利润", _safe_float_convert)
-            if op is None:
-                op = _get_value_from_row(income_row, "经营溢利", _safe_float_convert)
-            ca = _get_value_from_row(balance_row, "流动资产合计", _safe_float_convert)
-            cl = _get_value_from_row(balance_row, "流动负债", _safe_float_convert)
-            if cl is None:
-                cl = _get_value_from_row(balance_row, "流动负债合计", _safe_float_convert)
-            cfo = _get_value_from_row(
-                cashflow_row, "经营活动产生的现金流量净额", _safe_float_convert
-            )
-            if cfo is None:
-                cfo = _get_value_from_row(cashflow_row, "经营业务现金净额", _safe_float_convert)
-            dep_amort = _get_value_from_row(
+            # Base items (handle potential missing rows with multiple candidate keys)
+            def pick_first(row: pd.Series, keys: list[str]) -> float | None:
+                for k in keys:
+                    val = _get_value_from_row(row, k, _safe_float_convert)
+                    if val is not None:
+                        return val
+                return None
+
+            ni = pick_first(income_row, ["净利润", "归属于母公司股东的净利润", "net_income"])
+            rev = pick_first(income_row, ["营业总收入", "营业收入", "operating_revenue", "revenue"])
+            op = pick_first(income_row, ["营业利润", "经营利润", "operating_profit"])
+
+            ca = pick_first(balance_row, ["流动资产合计", "current_assets"])
+            cl = pick_first(balance_row, ["流动负债合计", "current_liabilities"])
+
+            cfo = pick_first(cashflow_row, ["经营活动产生的现金流量净额", "经营业务现金净额", "operating_cash_flow"])
+            dep_amort = pick_first(
                 cashflow_row,
-                "固定资产折旧、油气资产折耗、生产性生物资产折旧",
-                _safe_float_convert,
-            )  # Or sum of relevant lines
-            if dep_amort is None:
-                dep_amort = _get_value_from_row(cashflow_row, "减值及拨备", _safe_float_convert)
-            capex_paid = _get_value_from_row(
-                cashflow_row,
-                "购建固定资产、无形资产和其他长期资产所支付的现金",
-                _safe_float_convert,
+                [
+                    "固定资产折旧、油气资产折耗、生产性生物资产折旧",
+                    "减值及拨备",
+                    "depreciation_and_amortization",
+                ],
             )
-            if capex_paid is None:
-                capex_paid = _get_value_from_row(
-                    cashflow_row, "购建无形资产及其他资产", _safe_float_convert
-                )
+            capex_paid = pick_first(
+                cashflow_row,
+                [
+                    "购建固定资产、无形资产和其他长期资产所支付的现金",
+                    "购建无形资产及其他资产",
+                    "capital_expenditure",
+                ],
+            )
 
             item_data["net_income"] = ni
             item_data["operating_revenue"] = rev
@@ -847,7 +1416,7 @@ def get_insider_trades(
             return []
 
         # --- Manual Date Filtering & Limit ---
-        date_col = "交易日期"  # Verify name
+        date_col = "浜ゆ槗鏃ユ湡"  # Verify name
         if date_col in df.columns:
             try:
                 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -868,23 +1437,21 @@ def get_insider_trades(
 
         # Convert DataFrame rows to InsiderTrade objects
         for _, row in df.iterrows():
+            filing_date = _get_value_from_row(row, date_col, _format_output_date)
             trade_data = InsiderTrade(
                 ticker=normalized_ticker,
-                # Verify column names:
-                insider_name=_get_value_from_row(
-                    row, "内部人名称", str, default=""
-                ),  # Assuming string, provide default
-                insider_relation=_get_value_from_row(row, "职务", str, default=""),
-                transaction_date=_get_value_from_row(row, date_col, _format_output_date),
-                transaction_type=_get_value_from_row(
-                    row, "交易", str, default=""
-                ),  # e.g., 'Sale', 'Buy'
-                shares_transacted=_get_value_from_row(row, "交易股数", _safe_int_convert),
-                shares_held_after=_get_value_from_row(row, "持有股数", _safe_int_convert),
-                trade_price=_get_value_from_row(
-                    row, "交易价格", _safe_float_convert
-                ),  # Might be avg price
-                market=MarketType.US,
+                issuer=None,
+                name=_get_value_from_row(row, "内部人名称", str, default=None),
+                title=_get_value_from_row(row, "职务", str, default=None),
+                is_board_director=None,
+                transaction_date=filing_date,
+                transaction_shares=_get_value_from_row(row, "交易股数", _safe_float_convert),
+                transaction_price_per_share=_get_value_from_row(row, "交易价格", _safe_float_convert),
+                transaction_value=None,
+                shares_owned_before_transaction=None,
+                shares_owned_after_transaction=_get_value_from_row(row, "持有股数", _safe_float_convert),
+                security_title=None,
+                filing_date=filing_date or datetime.now().strftime("%Y-%m-%d"),
             )
             trades.append(trade_data)
 
@@ -905,156 +1472,82 @@ def get_stock_news(
     end_date: str | None = None,
     limit: int = 10,
 ) -> list[CompanyNews]:
-    """获取并处理个股新闻
-
-    Args:
-        symbol (str): 股票代码，如 "300059"
-        start_date (str, optional): 开始日期，格式为"YYYY-MM-DD"。默认为None，表示不限制开始日期。
-        end_date (str, optional): 结束日期，格式为"YYYY-MM-DD"。默认为None，表示不限制结束日期。(不包含结束日期)
-        max_news (int, optional): 获取的新闻条数，默认为10条。最大支持100条
-
-    Returns:
-        list: 新闻列表，每条新闻包含标题、内容、发布时间等信息
-    """
+    """Fetch and normalize company news for a symbol."""
     market = detect_market(symbol)
-
-    def limit_time(input_date, start_date, end_date):
-        if start_date and input_date < start_date:
-            return False
-        if end_date and input_date > end_date:
-            return False
-        return True
-
-    def filter_time_df(df, start_date, end_date):
-        df = df[df["发布时间"].apply(limit_time, args=(start_date, end_date))]
-        return df
-
-    # 设置pandas显示选项，确保显示完整内容
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.max_rows", None)
-    pd.set_option("display.max_colwidth", None)
-    pd.set_option("display.width", None)
-
-    # 限制最大新闻条数
-    limit = min(limit, 100)
-
-    # 获取当前日期
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # 构建新闻文件路径
-    news_dir = OMNIX_PATH / "financial" / "stock_news"
-    print(f"新闻保存目录: {news_dir}")
-
-    # 确保目录存在
-    try:
-        news_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"成功创建或确认目录存在: {news_dir}")
-    except Exception as e:
-        logger.error(f"创建目录失败: {e}")
-        return []
-
-    news_file = news_dir / f"{symbol}_news.json"
-    logger.info(f"新闻文件路径: {news_file}")
-
-    # 检查是否需要更新新闻
-    need_update = True
-    if news_file.exists():
-        try:
-            with open(news_file, encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("date") == today:
-                    cached_news = data.get("news", [])
-                    if len(cached_news) >= limit:
-                        logger.info(f"使用缓存的新闻数据: {news_file}")
-                        return cached_news[:limit]
-                    else:
-                        logger.info(
-                            f"缓存的新闻数量({len(cached_news)})不足，需要获取更多新闻({limit}条)"
-                        )
-        except Exception as e:
-            print(f"读取缓存文件失败: {e}")
-
-    logger.info(f"开始获取{symbol}的新闻数据...")
+    limit = max(1, min(limit, 100))
 
     try:
-        # 获取新闻列表
         news_df = ak.stock_news_em(symbol=symbol)
-        if news_df is None or len(news_df) == 0:
-            logger.warning(f"未获取到{symbol}的新闻数据")
-            return []
-
-        logger.info(f"成功获取到{len(news_df)}条新闻")
-        news_df = filter_time_df(news_df, start_date, end_date)
-
-        # 实际可获取的新闻数量
-        available_news_count = len(news_df)
-        if available_news_count < limit:
-            logger.warning(
-                f"警告：实际可获取的新闻数量({available_news_count})少于请求的数量({limit})"
-            )
-            limit = available_news_count
-
-        # 获取指定条数的新闻（考虑到可能有些新闻内容为空，多获取50%）
-        news_list = []
-        for _, row in news_df.head(int(limit * 1.5)).iterrows():
-            try:
-                # 获取新闻内容
-                content = (
-                    row["新闻内容"] if "新闻内容" in row and not pd.isna(row["新闻内容"]) else ""
-                )
-                if not content:
-                    content = row["新闻标题"]
-
-                # 只去除首尾空白字符
-                content = content.strip()
-                if len(content) < 10:  # 内容太短的跳过
-                    continue
-
-                # 获取关键词
-                keyword = row["关键词"] if "关键词" in row and not pd.isna(row["关键词"]) else ""
-
-                # 添加新闻
-                news_item = {
-                    "ticker": symbol,
-                    "title": row["新闻标题"].strip(),
-                    "content": content,
-                    "date": row["发布时间"],
-                    "source": row["文章来源"].strip(),
-                    "url": row["新闻链接"].strip(),
-                    "keyword": keyword.strip(),
-                    "market": market,
-                }
-                news_list.append(news_item)
-                logger.debug(f"成功添加新闻: {news_item['title']}")
-
-            except Exception as e:
-                print(f"处理单条新闻时出错: {e}")
-                continue
-
-        # 按发布时间排序
-        news_list.sort(key=lambda x: x["date"], reverse=True)
-
-        # 只保留指定条数的有效新闻
-        news_list = news_list[:limit]
-
-        # 保存到文件
-        try:
-            save_data = {"date": today, "news": news_list}
-            with open(news_file, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
-            print(f"成功保存{len(news_list)}条新闻到文件: {news_file}")
-        except Exception as e:
-            print(f"保存新闻数据到文件时出错: {e}")
-
-        return [CompanyNews(**news) for news in news_list]
-
     except Exception as e:
-        print(f"获取新闻数据时出错: {e}")
+        logger.error("Error fetching news for %s: %s", symbol, e, exc_info=True)
         return []
+
+    if news_df is None or news_df.empty:
+        return []
+
+    # Normalize common column names from AkShare.
+    col_map = {}
+    for col in news_df.columns:
+        col_str = str(col)
+        if "标题" in col_str:
+            col_map[col] = "title"
+        elif "发布时间" in col_str or "时间" in col_str:
+            col_map[col] = "date"
+        elif "来源" in col_str:
+            col_map[col] = "source"
+        elif "链接" in col_str:
+            col_map[col] = "url"
+        elif "关键词" in col_str:
+            col_map[col] = "keyword"
+        elif "内容" in col_str:
+            col_map[col] = "content"
+
+    df = news_df.rename(columns=col_map)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date", ascending=False)
+
+    if start_date and "date" in df.columns:
+        start_dt = pd.to_datetime(start_date, errors="coerce")
+        if pd.notna(start_dt):
+            df = df[df["date"] >= start_dt]
+    if end_date and "date" in df.columns:
+        end_dt = pd.to_datetime(end_date, errors="coerce")
+        if pd.notna(end_dt):
+            df = df[df["date"] <= end_dt]
+
+    rows = df.head(limit).to_dict(orient="records")
+    result: list[CompanyNews] = []
+    for row in rows:
+        title = str(row.get("title", "")).strip()
+        if not title:
+            continue
+        date_val = row.get("date")
+        if isinstance(date_val, pd.Timestamp):
+            date_str = date_val.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            date_str = str(date_val) if date_val is not None else ""
+
+        result.append(
+            CompanyNews(
+                ticker=symbol,
+                title=title,
+                source=str(row.get("source", "")).strip(),
+                date=date_str,
+                url=str(row.get("url", "")).strip(),
+                market=market,
+                publish_time=date_str,
+                content=str(row.get("content", "")).strip() or None,
+                keyword=str(row.get("keyword", "")).strip() or None,
+            )
+        )
+
+    return result
 
 
 def get_market_cap(
     ticker: str,
+    end_date: str | None = None,
     manual_input: dict[str, Any] | None = None,
 ) -> float | None:
     """
@@ -1096,9 +1589,7 @@ def get_market_cap(
 
         else:  # MarketType.CHINA
             latest_price = None
-            prices_list = get_prices(
-                normalized_ticker, end_date=datetime.now().strftime("%Y-%m-%d")
-            )
+            prices_list = get_prices(normalized_ticker, end_date=end_date)
             if prices_list:
                 latest_price = prices_list[-1].close
             else:
@@ -1109,7 +1600,9 @@ def get_market_cap(
             total_shares = None
             try:
                 info_df = ak.stock_individual_info_em(symbol=normalized_ticker)
-                total_shares_series = info_df[info_df["item"] == "总股本"]["value"]
+                total_shares_series = info_df[
+                    info_df["item"].astype(str).str.contains("总股本|股本", regex=True, na=False)
+                ]["value"]
                 if not total_shares_series.empty:
                     value_str = total_shares_series.iloc[0]
                     num_part_list = re.findall(r"[\d\.]+", value_str)
@@ -1118,9 +1611,9 @@ def get_market_cap(
                         multiplier = 1e8 if "亿" in value_str else 1e4 if "万" in value_str else 1
                         total_shares = float(num_part) * multiplier
                     else:
-                        logger.warning(f"Could not parse number from '总股本' value: {value_str}")
+                        logger.warning(f"Could not parse number from total shares value: {value_str}")
                 else:
-                    logger.warning(f"Could not find '总股本' in info for CN {normalized_ticker}")
+                    logger.warning(f"Could not find total shares in info for CN {normalized_ticker}")
             except Exception as e_info:
                 logger.warning(f"Failed to get total shares for CN {normalized_ticker}: {e_info}")
 
@@ -1145,6 +1638,21 @@ def get_market_cap(
     except Exception as e:
         logger.error(f"Error getting market cap for {normalized_ticker}: {e}", exc_info=True)
         return None
+
+
+def get_company_news(
+    symbol: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 10,
+) -> list[CompanyNews]:
+    """Backward-compatible alias for get_stock_news."""
+    return get_stock_news(
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+    )
 
 
 def prices_to_df(prices: list[Price]) -> pd.DataFrame:
@@ -1222,7 +1730,11 @@ def prices_to_df(prices: list[Price]) -> pd.DataFrame:
 
 
 def get_price_df(
-    ticker: str, start_date: str | None = None, end_date: str | None = None
+    ticker: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    interval: Literal["1d", "1m", "3m", "5m", "15m", "30m", "60m"] = "1d",
+    provider: Literal["akshare", "finnhub", "yfinance"] = "akshare",
 ) -> pd.DataFrame:
     """
     Fetch price data for the given ticker and convert directly to DataFrame,
@@ -1236,7 +1748,13 @@ def get_price_df(
     Returns:
         pd.DataFrame: DataFrame containing price data with Date index.
     """
-    prices = get_prices(ticker, start_date, end_date)
+    prices = get_prices(
+        ticker,
+        start_date,
+        end_date,
+        interval=interval,
+        provider=provider,
+    )
     return prices_to_df(prices)
 
 
@@ -1375,3 +1893,6 @@ if __name__ == "__main__":
         print(f"Moutai Line Items (latest 2): {moutai_items}")
     except Exception as e:
         print(f"Error getting Moutai line items: {e}")
+
+
+

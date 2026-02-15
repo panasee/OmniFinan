@@ -1,10 +1,16 @@
 import json
 
+import pandas as pd
 from langchain_core.messages import HumanMessage
 
-from .. import get_prices, prices_to_df
+from ..data.unified_service import UnifiedDataService
 from ..utils.progress import progress
-from .state import AgentState, show_agent_reasoning, show_workflow_status
+from .state import (
+    AgentState,
+    default_risk_debate_state,
+    show_agent_reasoning,
+    show_workflow_status,
+)
 
 
 ##### Risk Management Agent #####
@@ -15,27 +21,45 @@ def risk_management_agent(state: AgentState):
     portfolio = state["data"]["portfolio"]
     data = state["data"]
     tickers = data["tickers"]
+    data_service = state["metadata"].get("data_service")
+    if not isinstance(data_service, UnifiedDataService):
+        raise RuntimeError("risk_management_agent requires metadata.data_service")
 
     # Initialize risk analysis for each ticker
     risk_analysis = {}
+    debate_state = state["data"].get("debate_state", {})
+    risk_debate_state = state["data"].get("risk_debate_state") or default_risk_debate_state(
+        max_rounds=int(state["metadata"].get("max_risk_discuss_rounds", 1))
+    )
     current_prices = {}  # Store prices here to avoid redundant API calls
+    price_frames: dict[str, pd.DataFrame] = {}
 
     for ticker in tickers:
-        progress.update_status("risk_management_agent", ticker, "Analyzing price data")
-
-        prices = get_prices(
+        prices = data_service.get_prices(
             ticker=ticker,
             start_date=data["start_date"],
             end_date=data["end_date"],
         )
-
         if not prices:
+            continue
+        prices_df = pd.DataFrame(prices)
+        if prices_df.empty:
+            continue
+        prices_df["time"] = pd.to_datetime(prices_df["time"], errors="coerce")
+        prices_df = prices_df.dropna(subset=["time"]).sort_values("time")
+        if prices_df.empty:
+            continue
+        price_frames[ticker] = prices_df
+        current_prices[ticker] = float(prices_df["close"].iloc[-1])
+
+    for ticker in tickers:
+        progress.update_status("risk_management_agent", ticker, "Analyzing price data")
+        prices_df = price_frames.get(ticker)
+        if prices_df is None:
             progress.update_status(
                 "risk_management_agent", ticker, "Failed: No price data found"
             )
             continue
-
-        prices_df = prices_to_df(prices)
 
         progress.update_status(
             "risk_management_agent", ticker, "Calculating risk metrics"
@@ -94,20 +118,33 @@ def risk_management_agent(state: AgentState):
 
         # 3. Position Size Limits
         # Calculate portfolio value
-        current_price = prices_df["close"].iloc[-1]
-        current_prices[ticker] = current_price  # Store the current price
+        current_price = current_prices[ticker]
 
         # Calculate current position value for this ticker
-        current_position_value = portfolio.get("cost_basis", {}).get(ticker, 0)
+        position = portfolio.get("positions", {}).get(ticker, {})
+        long_shares = float(position.get("long", 0) or 0)
+        short_shares = float(position.get("short", 0) or 0)
+        current_position_value = (long_shares - short_shares) * current_price
+        if not position and "cost_basis" in portfolio:
+            current_position_value = float(portfolio.get("cost_basis", {}).get(ticker, 0) or 0)
 
         # Calculate total portfolio value using stored prices
-        total_portfolio_value = portfolio.get("cash", 0) + sum(
-            portfolio.get("cost_basis", {}).get(t, 0)
-            for t in portfolio.get("cost_basis", {})
-        )
+        total_portfolio_value = float(portfolio.get("cash", 0) or 0)
+        for t in tickers:
+            t_pos = portfolio.get("positions", {}).get(t, {})
+            t_long = float(t_pos.get("long", 0) or 0)
+            t_short = float(t_pos.get("short", 0) or 0)
+            t_px = current_prices.get(t)
+            if t_px is None:
+                continue
+            total_portfolio_value += (t_long - t_short) * t_px
+        if not portfolio.get("positions") and "cost_basis" in portfolio:
+            total_portfolio_value = float(portfolio.get("cash", 0) or 0) + sum(
+                float(v or 0) for v in portfolio.get("cost_basis", {}).values()
+            )
 
         # Base limit is 20% of portfolio for any single position
-        base_position_limit = total_portfolio_value * 0.20
+        base_position_limit = max(total_portfolio_value, 0.0) * 0.20
 
         # Adjust position limit based on risk score
         if market_risk_score >= 4:
@@ -189,6 +226,24 @@ def risk_management_agent(state: AgentState):
 
         progress.update_status("risk_management_agent", ticker, "Done")
 
+        risk_debate_state["risky_history"].append(
+            {ticker: {"signal": "bearish", "reason": "volatility/var/drawdown stress"}}
+        )
+        risk_debate_state["safe_history"].append(
+            {ticker: {"signal": "neutral", "reason": "position limit and cash constraints"}}
+        )
+        risk_debate_state["neutral_history"].append(
+            {ticker: {"signal": risk_analysis[ticker]["signal"], "reason": "risk score synthesis"}}
+        )
+        debate_state.setdefault("risk_arguments", []).append(
+            {
+                "ticker": ticker,
+                "signal": risk_analysis[ticker]["signal"],
+                "risk_score": risk_score,
+                "reason": risk_analysis[ticker]["reasoning"]["risk_assessment"],
+            }
+        )
+
     message = HumanMessage(
         content=json.dumps(risk_analysis),
         name="risk_management_agent",
@@ -201,6 +256,17 @@ def risk_management_agent(state: AgentState):
 
     # Add the signal to the analyst_signals list
     state["data"]["analyst_signals"]["risk_management_agent"] = risk_analysis
+    risk_debate_state["judge_decision"] = {
+        ticker: {
+            "signal": details["signal"],
+            "confidence": details["confidence"],
+            "trading_action": details["trading_action"],
+        }
+        for ticker, details in risk_analysis.items()
+    }
+    risk_debate_state["count"] = int(risk_debate_state.get("count", 0)) + 1
+    state["data"]["risk_debate_state"] = risk_debate_state
+    state["data"]["debate_state"] = debate_state
 
     show_workflow_status("Risk Manager", "completed")
     return state | {"messages": state["messages"] + [message], "data": data}

@@ -2,9 +2,30 @@ import json
 
 from langchain_core.messages import HumanMessage
 
-from .. import get_financial_metrics
+from ..data.unified_service import UnifiedDataService
 from ..utils.progress import progress
 from .state import AgentState, show_agent_reasoning
+
+
+def _metric_score(metric: float | None, threshold: float, *, higher_is_better: bool = True) -> int:
+    if metric is None:
+        return 0
+    if higher_is_better:
+        return 1 if metric > threshold else 0
+    return 1 if metric < threshold else 0
+
+
+def _compute_predictability(financial_metrics: list[dict], key: str) -> float:
+    values = [m.get(key) for m in financial_metrics if m.get(key) is not None]
+    if len(values) < 3:
+        return 0.0
+    mean_val = sum(values) / len(values)
+    if mean_val == 0:
+        return 0.0
+    variance = sum((v - mean_val) ** 2 for v in values) / len(values)
+    std = variance**0.5
+    # Higher is more predictable; clip to [0,1].
+    return max(0.0, min(1.0, 1 - abs(std / mean_val)))
 
 
 ##### Fundamental Agent #####
@@ -13,6 +34,9 @@ def fundamentals_agent(state: AgentState):
     data = state["data"]
     end_date = data["end_date"]
     tickers = data["tickers"]
+    data_service = state["metadata"].get("data_service")
+    if not isinstance(data_service, UnifiedDataService):
+        raise RuntimeError("fundamentals_agent requires metadata.data_service: UnifiedDataService")
 
     # Initialize fundamental analysis for each ticker
     fundamental_analysis = {}
@@ -23,7 +47,7 @@ def fundamentals_agent(state: AgentState):
         )
 
         # Get the financial metrics
-        financial_metrics = get_financial_metrics(
+        financial_metrics = data_service.get_financial_metrics(
             ticker=ticker,
             end_date=end_date,
             period="ttm",
@@ -202,6 +226,63 @@ def fundamentals_agent(state: AgentState):
             + (f"P/S: {ps_ratio:.2f}" if ps_ratio is not None else "P/S: N/A"),
         }
 
+        progress.update_status("fundamentals_agent", ticker, "Analyzing moat quality")
+        # 5. Moat/quality checks (objective cross-persona heuristics)
+        gross_margin = metrics.get("gross_margin")
+        return_on_invested_capital = metrics.get("return_on_invested_capital")
+        capex_to_revenue = metrics.get("capital_expenditure_to_revenue")
+        moat_score = (
+            _metric_score(gross_margin, 0.35)
+            + _metric_score(return_on_invested_capital, 0.12)
+            + _metric_score(capex_to_revenue, 0.08, higher_is_better=False)
+        )
+        signals.append(
+            "bullish" if moat_score >= 2 else "bearish" if moat_score == 0 else "neutral"
+        )
+        reasoning["moat_quality_signal"] = {
+            "signal": signals[4],
+            "details": (
+                f"Gross Margin: {gross_margin:.2%}" if gross_margin is not None else "Gross Margin: N/A"
+            )
+            + ", "
+            + (
+                f"ROIC: {return_on_invested_capital:.2%}"
+                if return_on_invested_capital is not None
+                else "ROIC: N/A"
+            )
+            + ", "
+            + (
+                f"Capex/Revenue: {capex_to_revenue:.2%}"
+                if capex_to_revenue is not None
+                else "Capex/Revenue: N/A"
+            ),
+        }
+
+        progress.update_status("fundamentals_agent", ticker, "Analyzing predictability")
+        # 6. Predictability/consistency checks using historical snapshots
+        revenue_predictability = _compute_predictability(financial_metrics, "revenue_growth")
+        margin_predictability = _compute_predictability(financial_metrics, "operating_margin")
+        earnings_predictability = _compute_predictability(financial_metrics, "earnings_growth")
+        predictability_score = sum(
+            p > 0.55
+            for p in [revenue_predictability, margin_predictability, earnings_predictability]
+        )
+        signals.append(
+            "bullish"
+            if predictability_score >= 2
+            else "bearish"
+            if predictability_score == 0
+            else "neutral"
+        )
+        reasoning["predictability_signal"] = {
+            "signal": signals[5],
+            "details": (
+                f"Revenue Predictability: {revenue_predictability:.2f}, "
+                f"Margin Predictability: {margin_predictability:.2f}, "
+                f"Earnings Predictability: {earnings_predictability:.2f}"
+            ),
+        }
+
         progress.update_status("fundamentals_agent", ticker, "Calculating final signal")
         # Determine overall signal (保持第一版逻辑)
         bullish_signals = signals.count("bullish")
@@ -216,9 +297,7 @@ def fundamentals_agent(state: AgentState):
 
         # Calculate confidence level (保持第一版格式)
         total_signals = len(signals)
-        confidence = (
-            round(max(bullish_signals, bearish_signals) / total_signals, 2) * 100
-        )
+        confidence = round(max(bullish_signals, bearish_signals) / total_signals, 4)
 
         fundamental_analysis[ticker] = {
             "signal": overall_signal,

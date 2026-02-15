@@ -7,15 +7,14 @@ Responsible for gathering and preprocessing market data for financial analysis.
 from datetime import datetime, timedelta
 from typing import Any
 
+import pandas as pd
 from pyomnix.omnix_logger import get_logger
 
-from .. import (
-    get_financial_metrics,
-    get_market_cap,
-    get_prices,
-    prices_to_df,
-    search_line_items,
-)
+from ..analysis.transform import build_feature_frame
+from ..data.cache import DataCache
+from ..data.providers.akshare_provider import AkshareProvider
+from ..data.symbols import is_crypto_ticker
+from ..data.unified_service import UnifiedDataService
 from ..utils.progress import progress
 from .state import AgentState, show_agent_reasoning
 
@@ -38,6 +37,9 @@ def market_data_agent(state: AgentState) -> AgentState:
 
     messages = state["messages"]
     data = state["data"]
+    data_service = state["metadata"].get("data_service")
+    if not isinstance(data_service, UnifiedDataService):
+        data_service = UnifiedDataService(provider=AkshareProvider(), cache=DataCache())
 
     # Set default dates
     current_date = datetime.now()
@@ -65,34 +67,62 @@ def market_data_agent(state: AgentState) -> AgentState:
     all_financial_metrics: dict[str, list[Any]] = {}
     all_financial_line_items: dict[str, list[Any]] = {}
     all_market_caps: dict[str, float | None] = {}
+    all_features: dict[str, list[dict[str, Any]]] = {}
+    macro_indicators: dict[str, Any] = {}
+
+    progress.update_status("market_data_agent", None, "Fetching macro indicators")
+    try:
+        macro_indicators = data_service.get_macro_indicators(start_date=start_date, end_date=end_date)
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError) as e:
+        logger.error("获取宏观数据失败: %s", e)
+        macro_indicators = {"series": {}, "latest": {}, "snapshot_at": None}
 
     # Process each ticker
     for ticker in tickers:
+        is_crypto = is_crypto_ticker(ticker)
         progress.update_status("market_data_agent", ticker, "Fetching price data")
 
         # 获取价格数据并验证
         try:
-            prices = get_prices(ticker, start_date, end_date)
-            prices_df = prices_to_df(prices)
+            prices_dict = data_service.get_prices(ticker, start_date, end_date)
+            prices_df = pd.DataFrame(prices_dict)
             if prices_df.empty:
                 logger.warning(f"警告：无法获取{ticker}的价格数据，将使用空数据继续")
-                prices_dict = []
+                all_features[ticker] = []
             else:
-                prices_dict = [p.model_dump() for p in prices]
+                # Standardize feature engineering for downstream research/backtest usage.
+                features_df = build_feature_frame(prices_df)
+                all_features[ticker] = features_df.fillna(0).to_dict(orient="records")
             all_prices[ticker] = prices_dict
-        except Exception as e:
-            logger.error(f"获取价格数据失败: {e!s}")
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as e:
+            logger.error("获取价格数据失败: %s", e)
             all_prices[ticker] = []
+            all_features[ticker] = []
 
         # 获取财务指标
+        if is_crypto:
+            # Crypto assets do not expose equity fundamentals in this pipeline.
+            all_financial_metrics[ticker] = []
+            all_financial_line_items[ticker] = []
+            all_market_caps[ticker] = None
+            progress.update_status(
+                "market_data_agent", ticker, "Skipping equity fundamentals for crypto"
+            )
+            progress.update_status("market_data_agent", ticker, "Data collection complete")
+            continue
+
         progress.update_status(
             "market_data_agent", ticker, "Fetching financial metrics"
         )
         try:
-            financial_metrics = get_financial_metrics(ticker, end_date)
-            all_financial_metrics[ticker] = [m.model_dump() for m in financial_metrics]
-        except Exception as e:
-            logger.error(f"获取财务指标失败: {e!s}")
+            all_financial_metrics[ticker] = data_service.get_financial_metrics(
+                ticker,
+                end_date,
+                period="ttm",
+                limit=1,
+            )
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as e:
+            logger.error("获取财务指标失败: %s", e)
             all_financial_metrics[ticker] = []
 
         # 获取财务报表行项目
@@ -100,22 +130,22 @@ def market_data_agent(state: AgentState) -> AgentState:
             "market_data_agent", ticker, "Fetching financial line items"
         )
         try:
-            # Common line items to search for
-            financial_line_items = search_line_items(ticker, period="ttm", limit=10)
-            all_financial_line_items[ticker] = [
-                item.model_dump() for item in financial_line_items
-            ]
-        except Exception as e:
-            logger.error(f"获取财务报表失败: {e!s}")
+            all_financial_line_items[ticker] = data_service.get_line_items(
+                ticker,
+                period="ttm",
+                limit=10,
+            )
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as e:
+            logger.error("获取财务报表失败: %s", e)
             all_financial_line_items[ticker] = []
 
         # 获取市值
         progress.update_status("market_data_agent", ticker, "Fetching market cap")
         try:
-            market_cap = get_market_cap(ticker, end_date)
+            market_cap = data_service.get_market_cap(ticker, end_date=end_date)
             all_market_caps[ticker] = market_cap
-        except Exception as e:
-            logger.error(f"获取市值失败: {e!s}")
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as e:
+            logger.error("获取市值失败: %s", e)
             all_market_caps[ticker] = None
 
         progress.update_status("market_data_agent", ticker, "Data collection complete")
@@ -142,6 +172,10 @@ def market_data_agent(state: AgentState) -> AgentState:
             },
         },
         "summary": f"为{', '.join(tickers)}收集了从{start_date}到{end_date}的市场数据，包括价格历史、财务指标和市场信息",
+        "macro_summary": {
+            "series_count": len((macro_indicators or {}).get("series", {})),
+            "latest": (macro_indicators or {}).get("latest", {}),
+        },
     }
 
     if show_reasoning:
@@ -161,6 +195,8 @@ def market_data_agent(state: AgentState) -> AgentState:
             "financial_metrics": all_financial_metrics,
             "financial_line_items": all_financial_line_items,
             "market_caps": all_market_caps,
+            "feature_frames": all_features,
+            "macro_indicators": macro_indicators,
         },
         "metadata": state["metadata"],
     }

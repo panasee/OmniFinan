@@ -1,11 +1,13 @@
 import json
 import math
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
 from langchain_core.messages import HumanMessage
 
-from .. import get_prices, prices_to_df
+from ..data.unified_service import UnifiedDataService
+from ..research.factors import mean, ref, std
 from ..utils.progress import progress
 from .state import AgentState, show_agent_reasoning
 
@@ -25,6 +27,9 @@ def technical_analyst_agent(state: AgentState):
     start_date = data["start_date"]
     end_date = data["end_date"]
     tickers = data["tickers"]
+    data_service = state["metadata"].get("data_service")
+    if not isinstance(data_service, UnifiedDataService):
+        raise RuntimeError("technical_analyst_agent requires metadata.data_service")
 
     # Initialize analysis for each ticker
     technical_analysis = {}
@@ -35,7 +40,7 @@ def technical_analyst_agent(state: AgentState):
         )
 
         # Get the historical price data
-        prices = get_prices(
+        prices = data_service.get_prices(
             ticker=ticker,
             start_date=start_date,
             end_date=end_date,
@@ -48,7 +53,19 @@ def technical_analyst_agent(state: AgentState):
             continue
 
         # Convert prices to a DataFrame
-        prices_df = prices_to_df(prices)
+        prices_df = pd.DataFrame(prices)
+        if prices_df.empty:
+            progress.update_status(
+                "technical_analyst_agent", ticker, "Failed: Empty price frame"
+            )
+            continue
+        prices_df["time"] = pd.to_datetime(prices_df["time"], errors="coerce")
+        prices_df = prices_df.dropna(subset=["time"]).sort_values("time")
+        if prices_df.empty:
+            progress.update_status(
+                "technical_analyst_agent", ticker, "Failed: Invalid time series"
+            )
+            continue
 
         progress.update_status(
             "technical_analyst_agent", ticker, "Calculating trend signals"
@@ -106,45 +123,47 @@ def technical_analyst_agent(state: AgentState):
         # Generate detailed analysis report for this ticker
         technical_analysis[ticker] = {
             "signal": combined_signal["signal"],
-            "confidence": round(combined_signal["confidence"] * 100),
+            "confidence": round(combined_signal["confidence"], 4),
             "strategy_signals": {
                 "trend_following": {
                     "signal": trend_signals["signal"],
-                    "confidence": round(trend_signals["confidence"] * 100),
+                    "confidence": round(trend_signals["confidence"], 4),
                     "metrics": normalize_pandas(trend_signals["metrics"]),
                 },
                 "mean_reversion": {
                     "signal": mean_reversion_signals["signal"],
-                    "confidence": round(mean_reversion_signals["confidence"] * 100),
+                    "confidence": round(mean_reversion_signals["confidence"], 4),
                     "metrics": normalize_pandas(mean_reversion_signals["metrics"]),
                 },
                 "momentum": {
                     "signal": momentum_signals["signal"],
-                    "confidence": round(momentum_signals["confidence"] * 100),
+                    "confidence": round(momentum_signals["confidence"], 4),
                     "metrics": normalize_pandas(momentum_signals["metrics"]),
                 },
                 "volatility": {
                     "signal": volatility_signals["signal"],
-                    "confidence": round(volatility_signals["confidence"] * 100),
+                    "confidence": round(volatility_signals["confidence"], 4),
                     "metrics": normalize_pandas(volatility_signals["metrics"]),
                 },
                 "statistical_arbitrage": {
                     "signal": stat_arb_signals["signal"],
-                    "confidence": round(stat_arb_signals["confidence"] * 100),
+                    "confidence": round(stat_arb_signals["confidence"], 4),
                     "metrics": normalize_pandas(stat_arb_signals["metrics"]),
                 },
                 "additional_indicators": {
                     "signal": additional_signals["signal"],
-                    "confidence": round(additional_signals["confidence"] * 100),
+                    "confidence": round(additional_signals["confidence"], 4),
                     "metrics": normalize_pandas(additional_signals["metrics"]),
                 },
             },
         }
         progress.update_status("technical_analyst_agent", ticker, "Done")
 
+    technical_analysis = normalize_pandas(technical_analysis)
+
     # Create the technical analyst message
     message = HumanMessage(
-        content=json.dumps(technical_analysis),
+        content=json.dumps(technical_analysis, ensure_ascii=False),
         name="technical_analyst_agent",
     )
 
@@ -300,15 +319,16 @@ def calculate_momentum_signals(prices_df):
     """
     Multi-factor momentum strategy
     """
-    # Price momentum
-    returns = prices_df["close"].pct_change()
-    mom_1m = returns.rolling(21).sum()
-    mom_3m = returns.rolling(63).sum()
-    mom_6m = returns.rolling(126).sum()
+    # Price momentum powered by factor helpers (qlib-style primitives).
+    returns = prices_df["close"] / ref(prices_df["close"], 1) - 1
+    mom_1m = mean(returns, 21) * 21
+    mom_3m = mean(returns, 63) * 63
+    mom_6m = mean(returns, 126) * 126
 
     # Volume momentum
     volume_ma = prices_df["volume"].rolling(21).mean()
     volume_momentum = prices_df["volume"] / volume_ma
+    momentum_stability = std(returns.fillna(0), 21).iloc[-1]
 
     # Relative strength
     # (would compare to market/sector in real implementation)
@@ -337,6 +357,7 @@ def calculate_momentum_signals(prices_df):
             "momentum_3m": float(mom_3m.iloc[-1]),
             "momentum_6m": float(mom_6m.iloc[-1]),
             "volume_momentum": float(volume_momentum.iloc[-1]),
+            "momentum_stability_21": float(momentum_stability),
         },
     }
 
@@ -464,6 +485,16 @@ def weighted_signal_combination(signals, weights):
 
 def normalize_pandas(obj):
     """Convert pandas Series/DataFrames to primitive Python types"""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return [normalize_pandas(item) for item in obj.tolist()]
+    if isinstance(obj, (pd.Timestamp, datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
     if isinstance(obj, pd.Series):
         return obj.tolist()
     elif isinstance(obj, pd.DataFrame):

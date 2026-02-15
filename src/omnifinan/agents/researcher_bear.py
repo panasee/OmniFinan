@@ -12,8 +12,9 @@ from pydantic import BaseModel, Field
 
 from pyomnix.omnix_logger import get_logger
 
+from ..utils.normalization import confidence_to_unit
 from ..utils.progress import progress
-from .state import AgentState, show_agent_reasoning
+from .state import AgentState, default_investment_debate_state, show_agent_reasoning
 
 # 设置日志记录
 logger = get_logger("researcher_bear_agent")
@@ -66,6 +67,7 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
         )
         sentiment_signals = analyst_signals.get("sentiment_agent", {}).get(ticker, {})
         valuation_signals = analyst_signals.get("valuation_agent", {}).get(ticker, {})
+        macro_signals = analyst_signals.get("macro_analyst_agent", {}).get(ticker, {})
 
         # Analyze from bearish perspective
         bearish_points = []
@@ -79,9 +81,7 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
             bearish_points.append(
                 f"Technical indicators show bearish momentum with {technical_signals.get('confidence')}% confidence"
             )
-            confidence_scores.append(
-                float(technical_signals.get("confidence", 0)) / 100
-            )
+            confidence_scores.append(confidence_to_unit(technical_signals.get("confidence", 0)))
         else:
             bearish_points.append(
                 "Technical rally may be temporary, suggesting potential reversal"
@@ -96,9 +96,7 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
             bearish_points.append(
                 f"Concerning fundamentals with {fundamental_signals.get('confidence')}% confidence"
             )
-            confidence_scores.append(
-                float(fundamental_signals.get("confidence", 0)) / 100
-            )
+            confidence_scores.append(confidence_to_unit(fundamental_signals.get("confidence", 0)))
         else:
             bearish_points.append("Current fundamental strength may not be sustainable")
             confidence_scores.append(0.3)
@@ -111,9 +109,7 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
             bearish_points.append(
                 f"Negative market sentiment with {sentiment_signals.get('confidence')}% confidence"
             )
-            confidence_scores.append(
-                float(sentiment_signals.get("confidence", 0)) / 100
-            )
+            confidence_scores.append(confidence_to_unit(sentiment_signals.get("confidence", 0)))
         else:
             bearish_points.append(
                 "Market sentiment may be overly optimistic, indicating potential risks"
@@ -128,14 +124,31 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
             bearish_points.append(
                 f"Stock appears overvalued with {valuation_signals.get('confidence')}% confidence"
             )
-            confidence_scores.append(
-                float(valuation_signals.get("confidence", 0)) / 100
-            )
+            confidence_scores.append(confidence_to_unit(valuation_signals.get("confidence", 0)))
         else:
             bearish_points.append(
                 "Current valuation may not fully reflect downside risks"
             )
             confidence_scores.append(0.3)
+
+        progress.update_status(
+            "researcher_bear_agent", ticker, "Analyzing macro signals"
+        )
+        if macro_signals.get("signal") == "bearish":
+            bearish_points.append(
+                f"Macro regime is restrictive with {macro_signals.get('confidence')}% confidence"
+            )
+            confidence_scores.append(confidence_to_unit(macro_signals.get("confidence", 0)))
+        elif macro_signals.get("signal") == "neutral":
+            bearish_points.append(
+                "Macro is mixed, so downside protection remains important"
+            )
+            confidence_scores.append(0.45)
+        else:
+            bearish_points.append(
+                "Macro tailwinds may fade if rates or inflation re-accelerate"
+            )
+            confidence_scores.append(0.25)
 
         # Calculate overall bearish confidence
         avg_confidence = (
@@ -177,6 +190,14 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
 
     progress.update_status("researcher_bear_agent", None, "Done")
 
+    debate_state = state["data"].get("investment_debate_state") or default_investment_debate_state(
+        max_rounds=int(state["metadata"].get("max_debate_rounds", 1))
+    )
+    debate_state["bear_history"].append(
+        {ticker: analysis.model_dump() for ticker, analysis in bearish_analyses.items()}
+    )
+    debate_state["count"] = int(debate_state.get("count", 0)) + 1
+
     # Update state with bearish analyses
     return {
         "messages": messages,
@@ -186,6 +207,7 @@ def researcher_bear_agent(state: AgentState) -> AgentState:
                 ticker: analysis.model_dump()
                 for ticker, analysis in bearish_analyses.items()
             },
+            "investment_debate_state": debate_state,
         },
         "metadata": state["metadata"],
     }

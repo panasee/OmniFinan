@@ -11,11 +11,8 @@ from statistics import median
 
 from langchain_core.messages import HumanMessage
 
-from .. import (
-    get_financial_metrics,
-    get_market_cap,
-    search_line_items,
-)
+from ..data.unified_service import UnifiedDataService
+from ..research.valuation import dcf_intrinsic_value, valuation_signal
 from ..utils.progress import progress
 from .state import AgentState, show_agent_reasoning
 
@@ -26,6 +23,9 @@ def valuation_agent(state: AgentState):
     data = state["data"]
     end_date = data["end_date"]
     tickers = data["tickers"]
+    data_service = state["metadata"].get("data_service")
+    if not isinstance(data_service, UnifiedDataService):
+        raise RuntimeError("valuation_agent requires metadata.data_service")
 
     valuation_analysis: dict[str, dict] = {}
 
@@ -33,7 +33,7 @@ def valuation_agent(state: AgentState):
         progress.update_status("valuation_agent", ticker, "Fetching financial data")
 
         # --- Historical financial metrics (pull 8 latest TTM snapshots for medians) ---
-        financial_metrics = get_financial_metrics(
+        financial_metrics = data_service.get_financial_metrics(
             ticker=ticker,
             end_date=end_date,
             period="ttm",
@@ -48,7 +48,7 @@ def valuation_agent(state: AgentState):
 
         # --- Fine‑grained line‑items (need two periods to calc WC change) ---
         progress.update_status("valuation_agent", ticker, "Gathering line items")
-        line_items = search_line_items(ticker, period="ttm", limit=2)
+        line_items = data_service.get_line_items(ticker, period="ttm", limit=2)
         if len(line_items) < 2:
             progress.update_status(
                 "valuation_agent", ticker, "Failed: Insufficient financial line items"
@@ -59,14 +59,14 @@ def valuation_agent(state: AgentState):
         # ------------------------------------------------------------------
         # Enhanced Valuation models
         # ------------------------------------------------------------------
-        wc_change = li_curr.working_capital - li_prev.working_capital
-        growth_rate = most_recent_metrics.earnings_growth or 0.05
+        wc_change = (li_curr.get("working_capital") or 0) - (li_prev.get("working_capital") or 0)
+        growth_rate = most_recent_metrics.get("earnings_growth") or 0.05
 
         # Improved Owner Earnings with dynamic growth decay
         owner_val = calculate_owner_earnings_value(
-            net_income=li_curr.net_income,
-            depreciation=li_curr.depreciation_and_amortization,
-            capex=li_curr.capital_expenditure,
+            net_income=li_curr.get("net_income"),
+            depreciation=li_curr.get("depreciation_and_amortization"),
+            capex=li_curr.get("capital_expenditure"),
             working_capital_change=wc_change,
             growth_rate=growth_rate,
             required_return=0.15,
@@ -76,11 +76,19 @@ def valuation_agent(state: AgentState):
 
         # Enhanced DCF with growth rate constraints
         dcf_val = calculate_intrinsic_value(
-            free_cash_flow=li_curr.free_cash_flow,
+            free_cash_flow=li_curr.get("free_cash_flow"),
             growth_rate=growth_rate,
             discount_rate=0.10,
             terminal_growth_rate=0.03,
             num_years=5,
+        )
+        # Also compute simplified research-layer DCF for cross-check consistency.
+        research_dcf_val = dcf_intrinsic_value(
+            free_cash_flow=max(li_curr.get("free_cash_flow") or 0, 0.0),
+            growth_rate=max(growth_rate, 0.0),
+            discount_rate=0.10,
+            terminal_growth=0.03,
+            years=5,
         )
 
         # EV/EBITDA multiple valuation (from first version)
@@ -88,16 +96,16 @@ def valuation_agent(state: AgentState):
 
         # Residual Income Model (from first version)
         rim_val = calculate_residual_income_value(
-            market_cap=most_recent_metrics.market_cap,
-            net_income=li_curr.net_income,
-            price_to_book_ratio=most_recent_metrics.price_to_book_ratio,
-            book_value_growth=most_recent_metrics.book_value_growth or 0.03,
+            market_cap=most_recent_metrics.get("market_cap"),
+            net_income=li_curr.get("net_income"),
+            price_to_book_ratio=most_recent_metrics.get("price_to_book_ratio"),
+            book_value_growth=most_recent_metrics.get("book_value_growth") or 0.03,
         )
 
         # ------------------------------------------------------------------
         # Aggregate & signal with asymmetric thresholds
         # ------------------------------------------------------------------
-        market_cap = get_market_cap(ticker, end_date)
+        market_cap = data_service.get_market_cap(ticker, end_date)
         if not market_cap:
             progress.update_status(
                 "valuation_agent", ticker, "Failed: Market cap unavailable"
@@ -105,11 +113,19 @@ def valuation_agent(state: AgentState):
             continue
 
         # Method weights (sum to 1)
+        pe_ratio = most_recent_metrics.get("price_to_earnings_ratio") or 0
+        earnings_growth = most_recent_metrics.get("earnings_growth") or 0
+        peg_value = (pe_ratio / (earnings_growth * 100)) if earnings_growth > 0 else 0
+        peg_implied_signal = "bullish" if 0 < peg_value < 1.2 else "bearish" if peg_value > 2 else "neutral"
+        ev_to_ebit = most_recent_metrics.get("enterprise_value_to_ebit_ratio") or 0
+        ev_ebit_signal = "bullish" if 0 < ev_to_ebit < 14 else "bearish" if ev_to_ebit > 22 else "neutral"
+
         method_values = {
             "dcf": {"value": dcf_val, "weight": 0.35},
+            "research_dcf": {"value": research_dcf_val, "weight": 0.10},
             "owner_earnings": {"value": owner_val, "weight": 0.35},
             "ev_ebitda": {"value": ev_ebitda_val, "weight": 0.20},
-            "residual_income": {"value": rim_val, "weight": 0.10},
+            "residual_income": {"value": rim_val, "weight": 0.00},
         }
 
         # Calculate gaps with asymmetric thresholds
@@ -148,7 +164,15 @@ def valuation_agent(state: AgentState):
             if weighted_gap < -0.20
             else "neutral"
         )
-        confidence = round(min(abs(weighted_gap) / 0.30 * 100, 100))
+        # Fuse with shared valuation helper output (market_cap used as current valuation proxy).
+        helper_signal = valuation_signal(
+            current_price=float(market_cap),
+            intrinsic_value=float(research_dcf_val),
+            margin_threshold=0.15,
+        )
+        if helper_signal != "neutral":
+            signal = helper_signal
+        confidence = round(min(abs(weighted_gap) / 0.30, 1.0), 4)
 
         # Prepare reasoning output
         reasoning = {
@@ -161,6 +185,19 @@ def valuation_agent(state: AgentState):
             }
             for m, vals in method_values.items()
             if vals["value"] > 0
+        }
+        reasoning["relative_valuation_checks"] = {
+            "signal": "bullish"
+            if [peg_implied_signal, ev_ebit_signal].count("bullish")
+            > [peg_implied_signal, ev_ebit_signal].count("bearish")
+            else "bearish"
+            if [peg_implied_signal, ev_ebit_signal].count("bearish")
+            > [peg_implied_signal, ev_ebit_signal].count("bullish")
+            else "neutral",
+            "details": (
+                f"PEG: {peg_value:.2f} ({peg_implied_signal}), "
+                f"EV/EBIT: {ev_to_ebit:.2f} ({ev_ebit_signal})"
+            ),
         }
 
         valuation_analysis[ticker] = {
@@ -263,21 +300,24 @@ def calculate_ev_ebitda_value(financial_metrics: list) -> float:
     if not financial_metrics:
         return 0
     m0 = financial_metrics[0]
-    if not (m0.enterprise_value and m0.enterprise_value_to_ebitda_ratio):
+    ev = m0.get("enterprise_value")
+    ev_to_ebitda = m0.get("enterprise_value_to_ebitda_ratio")
+    market_cap = m0.get("market_cap")
+    if not (ev and ev_to_ebitda):
         return 0
-    if m0.enterprise_value_to_ebitda_ratio == 0:
+    if ev_to_ebitda == 0:
         return 0
 
-    ebitda_now = m0.enterprise_value / m0.enterprise_value_to_ebitda_ratio
+    ebitda_now = ev / ev_to_ebitda
     med_mult = median(
         [
-            m.enterprise_value_to_ebitda_ratio
+            m.get("enterprise_value_to_ebitda_ratio")
             for m in financial_metrics
-            if m.enterprise_value_to_ebitda_ratio
+            if m.get("enterprise_value_to_ebitda_ratio")
         ]
     )
     ev_implied = med_mult * ebitda_now
-    net_debt = (m0.enterprise_value or 0) - (m0.market_cap or 0)
+    net_debt = (ev or 0) - (market_cap or 0)
     return max(ev_implied - net_debt, 0)
 
 

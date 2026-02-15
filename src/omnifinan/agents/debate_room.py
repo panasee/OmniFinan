@@ -14,8 +14,14 @@ from pydantic import BaseModel, Field
 from pyomnix.omnix_logger import get_logger
 
 from ..utils.llm import call_llm
+from ..utils.normalization import confidence_to_unit
 from ..utils.progress import progress
-from .state import AgentState, show_agent_reasoning
+from .state import (
+    AgentState,
+    default_debate_state,
+    default_investment_debate_state,
+    show_agent_reasoning,
+)
 
 # 获取日志记录器
 logger = get_logger("debate_room")
@@ -71,6 +77,16 @@ def debate_room_agent(state: AgentState) -> AgentState:
 
     # Initialize results container
     debate_analyses: dict[str, DebateAnalysis] = {}
+    investment_debate_state = state["data"].get(
+        "investment_debate_state",
+        default_investment_debate_state(
+            max_rounds=int(state["metadata"].get("max_debate_rounds", 1))
+        ),
+    )
+    debate_state = state["data"].get(
+        "debate_state",
+        default_debate_state(max_rounds=int(state["metadata"].get("max_debate_rounds", 1))),
+    )
 
     for ticker in tickers:
         progress.update_status(
@@ -93,8 +109,8 @@ def debate_room_agent(state: AgentState) -> AgentState:
         )
 
         # 比较置信度级别
-        bull_confidence = bull_thesis.get("confidence", 0)
-        bear_confidence = bear_thesis.get("confidence", 0)
+        bull_confidence = confidence_to_unit(bull_thesis.get("confidence", 0))
+        bear_confidence = confidence_to_unit(bear_thesis.get("confidence", 0))
 
         # 分析辩论观点
         debate_summary = []
@@ -161,37 +177,46 @@ def debate_room_agent(state: AgentState) -> AgentState:
         # Prepare the prompt
         formatted_prompt = prompt_template.format(perspectives=perspectives_text)
 
-        # Call the LLM
+        # Call the LLM in configurable multi-round debate mode.
         llm_analysis = None
-        llm_score = 0  # 默认为中性
-
-        try:
-            # Call LLM with the Pydantic model
-            llm_output = call_llm(
-                prompt=formatted_prompt,
-                model_name=state["metadata"].get("model_name", "deepseek-chat"),
-                provider_api=state["metadata"].get("provider_api", "deepseek"),
-                pydantic_model=LLMDebateOutput,
-                agent_name="debate_room_agent",
-            )
-
-            llm_analysis = {
-                "analysis": llm_output.analysis,
-                "score": llm_output.score,
-                "reasoning": llm_output.reasoning,
-            }
-            llm_score = float(llm_output.score)
-            # 确保分数在有效范围内
-            llm_score = max(min(llm_score, 1.0), -1.0)
-            logger.info(f"成功解析 LLM 回复，评分: {llm_score}")
-
-        except Exception as e:
-            logger.error(f"调用 LLM 失败: {e}")
-            llm_analysis = {
-                "analysis": "LLM API call failed",
-                "score": 0,
-                "reasoning": "API error",
-            }
+        llm_score = 0
+        debate_rounds = max(int(state["metadata"].get("max_debate_rounds", 1)), 1)
+        for round_idx in range(debate_rounds):
+            try:
+                llm_output = call_llm(
+                    prompt=formatted_prompt,
+                    model_name=state["metadata"].get("model_name", "deepseek-chat"),
+                    provider_api=state["metadata"].get("provider_api", "deepseek"),
+                    pydantic_model=LLMDebateOutput,
+                    max_retries=int(state["metadata"].get("llm_max_retries", 3)),
+                    agent_name="debate_room_agent",
+                    trace=state["metadata"].get("trace"),
+                    scratchpad=state["metadata"].get("scratchpad"),
+                    temperature=state["metadata"].get("temperature"),
+                    seed=state["metadata"].get("llm_seed"),
+                    deterministic_mode=bool(state["metadata"].get("deterministic_mode", False)),
+                )
+                round_score = float(llm_output.score)
+                round_score = max(min(round_score, 1.0), -1.0)
+                llm_score = (llm_score * round_idx + round_score) / (round_idx + 1)
+                llm_analysis = {
+                    "analysis": llm_output.analysis,
+                    "score": llm_score,
+                    "reasoning": llm_output.reasoning,
+                }
+                debate_state["round"] = round_idx + 1
+                debate_state["bull_arguments"].extend(bull_thesis.get("thesis_points", []))
+                debate_state["bear_arguments"].extend(bear_thesis.get("thesis_points", []))
+                debate_state["moderator_score"] = llm_score
+                logger.info("Debate round %s score: %s", round_idx + 1, llm_score)
+            except Exception as e:
+                logger.error(f"调用 LLM 失败: {e}")
+                llm_analysis = {
+                    "analysis": "LLM API call failed",
+                    "score": 0,
+                    "reasoning": "API error",
+                }
+                break
 
         # 计算混合置信度差异
         confidence_diff = bull_confidence - bear_confidence
@@ -245,6 +270,10 @@ def debate_room_agent(state: AgentState) -> AgentState:
         debate_analyses[ticker] = debate_analysis
         progress.update_status("debate_room_agent", ticker, "Debate analysis complete")
 
+    investment_debate_state["judge_decision"] = {
+        ticker: analysis.model_dump() for ticker, analysis in debate_analyses.items()
+    }
+
     # Create messages for each ticker
     messages = state["messages"].copy()
     for ticker, analysis in debate_analyses.items():
@@ -274,6 +303,8 @@ def debate_room_agent(state: AgentState) -> AgentState:
                 ticker: analysis.model_dump()
                 for ticker, analysis in debate_analyses.items()
             },
+            "investment_debate_state": investment_debate_state,
+            "debate_state": debate_state,
         },
         "metadata": state["metadata"],
     }

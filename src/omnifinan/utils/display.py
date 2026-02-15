@@ -5,6 +5,7 @@ from colorama import Fore, Style
 from tabulate import tabulate
 
 from .analysts import ANALYST_ORDER
+from .normalization import confidence_to_percent
 
 
 def sort_agent_signals(signals):
@@ -95,7 +96,7 @@ def print_trading_output(result: dict) -> None:
                 [
                     f"{Fore.CYAN}{agent_name}{Style.RESET_ALL}",
                     f"{signal_color}{signal_type}{Style.RESET_ALL}",
-                    f"{Fore.WHITE}{confidence}%{Style.RESET_ALL}",
+                    f"{Fore.WHITE}{confidence_to_percent(confidence):.1f}%{Style.RESET_ALL}",
                     f"{Fore.WHITE}{reasoning_str}{Style.RESET_ALL}",
                 ]
             )
@@ -149,7 +150,7 @@ def print_trading_output(result: dict) -> None:
             ["Quantity", f"{action_color}{decision.get('quantity')}{Style.RESET_ALL}"],
             [
                 "Confidence",
-                f"{Fore.WHITE}{decision.get('confidence'):.1f}%{Style.RESET_ALL}",
+                f"{Fore.WHITE}{confidence_to_percent(decision.get('confidence')):.1f}%{Style.RESET_ALL}",
             ],
             ["Reasoning", f"{Fore.WHITE}{wrapped_reasoning}{Style.RESET_ALL}"],
         ]
@@ -184,7 +185,7 @@ def print_trading_output(result: dict) -> None:
                 f"{Fore.CYAN}{ticker}{Style.RESET_ALL}",
                 f"{action_color}{action}{Style.RESET_ALL}",
                 f"{action_color}{decision.get('quantity')}{Style.RESET_ALL}",
-                f"{Fore.WHITE}{decision.get('confidence'):.1f}%{Style.RESET_ALL}",
+                f"{Fore.WHITE}{confidence_to_percent(decision.get('confidence')):.1f}%{Style.RESET_ALL}",
             ]
         )
 
