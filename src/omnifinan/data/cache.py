@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,15 @@ class DataCache:
         ns_dir = self.request_root / namespace
         ns_dir.mkdir(parents=True, exist_ok=True)
         return ns_dir / f"{key_hash}.json"
+
+    def get_request_updated_at(self, namespace: str, params: dict[str, Any]) -> datetime | None:
+        path = self._request_key_path(namespace, params)
+        if not path.exists():
+            return None
+        try:
+            return datetime.fromtimestamp(path.stat().st_mtime)
+        except Exception:
+            return None
 
     def get(self, namespace: str, params: dict[str, Any], ttl_seconds: int | None = None) -> Any | None:
         path = self._request_key_path(namespace, params)

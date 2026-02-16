@@ -35,7 +35,7 @@ def run_cli() -> None:
         "--data-provider",
         type=str,
         default="akshare",
-        choices=["akshare", "finnhub", "yfinance"],
+        choices=["akshare", "finnhub", "yfinance", "sec_edgar"],
     )
     args = parser.parse_args()
 

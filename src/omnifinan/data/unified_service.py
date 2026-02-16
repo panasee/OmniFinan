@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from statistics import median
 from typing import Any
+
+from pyomnix.omnix_logger import get_logger
 
 from .cache import DataCache
 from .providers.base import DataProvider
 from .providers.yfinance_provider import YFinanceProvider
 from .symbols import is_crypto_ticker
+
+logger = get_logger("unified_data_service")
 
 
 class UnifiedDataService:
@@ -112,6 +117,297 @@ class UnifiedDataService:
         for row in incoming:
             merged[_trade_key(row)] = row
         return list(merged.values())
+
+    def _merge_macro_payloads(self, existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        if not existing:
+            return incoming
+        out = dict(existing)
+        ex_series = existing.get("series", {}) if isinstance(existing.get("series"), dict) else {}
+        in_series = incoming.get("series", {}) if isinstance(incoming.get("series"), dict) else {}
+        merged_series: dict[str, dict[str, Any]] = {}
+
+        all_keys = set(ex_series.keys()) | set(in_series.keys())
+        for key in all_keys:
+            a = ex_series.get(key, {}) if isinstance(ex_series.get(key), dict) else {}
+            b = in_series.get(key, {}) if isinstance(in_series.get(key), dict) else {}
+            a_obs = a.get("observations", []) if isinstance(a.get("observations"), list) else []
+            b_obs = b.get("observations", []) if isinstance(b.get("observations"), list) else []
+            obs_map: dict[str, dict[str, Any]] = {}
+            for row in a_obs:
+                if isinstance(row, dict) and row.get("date") is not None:
+                    obs_map[str(row.get("date"))] = row
+            for row in b_obs:
+                if isinstance(row, dict) and row.get("date") is not None:
+                    obs_map[str(row.get("date"))] = row
+            merged_obs = sorted(obs_map.values(), key=lambda x: str(x.get("date", "")))
+            merged = dict(a)
+            merged.update(b)
+            merged["observations"] = merged_obs
+            if merged_obs:
+                merged["latest"] = merged_obs[-1]
+                merged["previous"] = merged_obs[-2] if len(merged_obs) > 1 else None
+                # If we have valid observations after merge, treat transient fetch errors as resolved.
+                merged["error"] = None
+                if len(merged_obs) > 1:
+                    prev_val = merged_obs[-2].get("value")
+                    last_val = merged_obs[-1].get("value")
+                    if isinstance(prev_val, int | float) and isinstance(last_val, int | float):
+                        if last_val > prev_val:
+                            merged["trend"] = "up"
+                        elif last_val < prev_val:
+                            merged["trend"] = "down"
+                        else:
+                            merged["trend"] = "flat"
+            merged_series[key] = merged
+
+        out.update(incoming)
+        out["series"] = merged_series
+        out["latest"] = {
+            key: val.get("latest", {}).get("value")
+            if isinstance(val, dict) and isinstance(val.get("latest"), dict)
+            else None
+            for key, val in merged_series.items()
+        }
+        return out
+
+    def _is_non_empty_macro_payload(self, payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        series = payload.get("series", {})
+        if not isinstance(series, dict) or not series:
+            return False
+        for val in series.values():
+            if not isinstance(val, dict):
+                continue
+            obs = val.get("observations", [])
+            if isinstance(obs, list) and len(obs) > 0:
+                return True
+            latest = val.get("latest")
+            if isinstance(latest, dict) and latest.get("value") is not None:
+                return True
+        return False
+
+    def _macro_payload_has_gaps(self, payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        series = payload.get("series", {})
+        if not isinstance(series, dict) or not series:
+            return True
+        for key, val in series.items():
+            if not isinstance(val, dict):
+                return True
+            if self._is_terminal_macro_unavailable(str(key), val):
+                continue
+            if val.get("error"):
+                return True
+            obs = val.get("observations", [])
+            latest = val.get("latest")
+            has_obs = isinstance(obs, list) and len(obs) > 0
+            has_latest = isinstance(latest, dict) and latest.get("value") is not None
+            if not has_obs and not has_latest:
+                return True
+        return False
+
+    def _is_terminal_macro_unavailable(self, series_key: str, item: dict[str, Any]) -> bool:
+        if series_key in {"us_pmi_manufacturing", "us_pmi_services"}:
+            # PMI source migrated from fixed-unavailable placeholder to ISM public feed.
+            return False
+        source = str(item.get("source", ""))
+        error = str(item.get("error", ""))
+        if source == "fixed_sources_unavailable":
+            return True
+        return "unavailable in current fixed providers" in error
+
+    def _macro_gap_keys(self, payload: dict[str, Any] | None) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
+        series = payload.get("series", {})
+        if not isinstance(series, dict):
+            return []
+        gaps: list[str] = []
+        for key, val in series.items():
+            if not isinstance(val, dict):
+                gaps.append(str(key))
+                continue
+            if self._is_terminal_macro_unavailable(str(key), val):
+                continue
+            if val.get("error"):
+                gaps.append(str(key))
+                continue
+            obs = val.get("observations", [])
+            latest = val.get("latest")
+            has_obs = isinstance(obs, list) and len(obs) > 0
+            has_latest = isinstance(latest, dict) and latest.get("value") is not None
+            if not has_obs and not has_latest:
+                gaps.append(str(key))
+        return gaps
+
+    def _macro_latest_date(self, item: dict[str, Any]) -> date | None:
+        latest = item.get("latest")
+        if isinstance(latest, dict):
+            d = self._parse_date(latest.get("date"))
+            if d is not None:
+                return d
+        obs = item.get("observations", [])
+        if not isinstance(obs, list):
+            return None
+        dates = [self._parse_date(row.get("date")) for row in obs if isinstance(row, dict)]
+        parsed = [d for d in dates if d is not None]
+        return max(parsed) if parsed else None
+
+    def _macro_cycle_days(self, series_key: str, item: dict[str, Any]) -> int | None:
+        obs = item.get("observations", [])
+        if isinstance(obs, list):
+            parsed = sorted(
+                {
+                    d
+                    for d in (self._parse_date(row.get("date")) for row in obs if isinstance(row, dict))
+                    if d is not None
+                }
+            )
+            if len(parsed) >= 2:
+                deltas = [(parsed[i] - parsed[i - 1]).days for i in range(1, len(parsed))]
+                positive = [d for d in deltas if d > 0]
+                if positive:
+                    inferred = int(round(float(median(positive))))
+                    return max(1, min(400, inferred))
+
+        key = series_key.lower()
+        source = str(item.get("source", "")).lower()
+        if source.startswith("world_bank:"):
+            return 365
+        if "gdp" in key or "quarter" in key:
+            return 90
+        if any(s in key for s in ("cpi", "ppi", "payroll", "retail", "industrial", "unemployment", "m2", "pmi")):
+            return 30
+        if any(
+            s in key
+            for s in (
+                "sofr",
+                "rate",
+                "yield",
+                "treasury",
+                "spread",
+                "vix",
+                "equity",
+                "commodity",
+                "fx",
+                "shibor",
+                "lpr",
+            )
+        ):
+            return 1
+        return None
+
+    def _macro_stale_keys(self, payload: dict[str, Any] | None, as_of: date) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
+        series = payload.get("series", {})
+        if not isinstance(series, dict):
+            return []
+        stale: list[str] = []
+        for key, val in series.items():
+            if not isinstance(val, dict):
+                stale.append(str(key))
+                continue
+            if self._is_terminal_macro_unavailable(str(key), val):
+                continue
+            if val.get("error"):
+                stale.append(str(key))
+                continue
+            obs = val.get("observations", [])
+            latest = val.get("latest")
+            has_obs = isinstance(obs, list) and len(obs) > 0
+            has_latest = isinstance(latest, dict) and latest.get("value") is not None
+            if not has_obs and not has_latest:
+                stale.append(str(key))
+                continue
+            last_date = self._macro_latest_date(val)
+            if last_date is None:
+                stale.append(str(key))
+                continue
+            cycle_days = self._macro_cycle_days(str(key), val)
+            # Prefer per-series publication cycle, and only fallback to 30 days
+            # when cycle inference is not available.
+            stale_threshold_days = 30 if cycle_days is None else max(1, int(cycle_days) * 3)
+            if (as_of - last_date).days > stale_threshold_days:
+                stale.append(str(key))
+        return stale
+
+    def _macro_update_summary(self, before: dict[str, Any] | None, after: dict[str, Any]) -> str:
+        if not isinstance(before, dict):
+            return "initialized"
+        before_series = before.get("series", {}) if isinstance(before.get("series"), dict) else {}
+        after_series = after.get("series", {}) if isinstance(after.get("series"), dict) else {}
+        changed: list[str] = []
+        for key in sorted(set(before_series.keys()) | set(after_series.keys())):
+            b = before_series.get(key, {}) if isinstance(before_series.get(key), dict) else {}
+            a = after_series.get(key, {}) if isinstance(after_series.get(key), dict) else {}
+            b_latest = b.get("latest", {}).get("value") if isinstance(b.get("latest"), dict) else None
+            a_latest = a.get("latest", {}).get("value") if isinstance(a.get("latest"), dict) else None
+            b_cnt = len(b.get("observations", [])) if isinstance(b.get("observations"), list) else 0
+            a_cnt = len(a.get("observations", [])) if isinstance(a.get("observations"), list) else 0
+            if b_latest != a_latest or b_cnt != a_cnt:
+                changed.append(key)
+        return ",".join(changed[:10]) if changed else ""
+
+    def _filter_macro_payload_window(
+        self,
+        payload: dict[str, Any] | None,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return payload
+        if not start_date and not end_date:
+            return payload
+        out = dict(payload)
+        series = payload.get("series", {})
+        if not isinstance(series, dict):
+            return out
+        start = self._parse_date(start_date)
+        end = self._parse_date(end_date)
+        filtered_series: dict[str, dict[str, Any]] = {}
+        latest_map: dict[str, Any] = {}
+        for key, val in series.items():
+            if not isinstance(val, dict):
+                continue
+            cloned = dict(val)
+            obs = val.get("observations", [])
+            if isinstance(obs, list):
+                filtered_obs: list[dict[str, Any]] = []
+                for row in obs:
+                    if not isinstance(row, dict):
+                        continue
+                    d = self._parse_date(str(row.get("date")))
+                    if d is None:
+                        continue
+                    if start and d < start:
+                        continue
+                    if end and d > end:
+                        continue
+                    filtered_obs.append(row)
+                cloned["observations"] = filtered_obs
+                if filtered_obs:
+                    cloned["latest"] = filtered_obs[-1]
+                    cloned["previous"] = filtered_obs[-2] if len(filtered_obs) > 1 else None
+                    latest_map[key] = filtered_obs[-1].get("value")
+                else:
+                    # If window has no points, keep last known value for continuity.
+                    if obs:
+                        latest = val.get("latest")
+                        previous = val.get("previous")
+                        cloned["latest"] = latest if isinstance(latest, dict) else None
+                        cloned["previous"] = previous if isinstance(previous, dict) else None
+                        latest_map[key] = latest.get("value") if isinstance(latest, dict) else None
+                        cloned["note"] = "window_no_points_using_last_known"
+                    else:
+                        latest = cloned.get("latest")
+                        latest_map[key] = latest.get("value") if isinstance(latest, dict) else None
+            filtered_series[key] = cloned
+        out["series"] = filtered_series
+        out["latest"] = latest_map
+        return out
 
     def _sort_by_date(self, items: list[dict[str, Any]], date_field: str, descending: bool = False):
         return sorted(
@@ -266,12 +562,134 @@ class UnifiedDataService:
         )
 
     def get_macro_indicators(self, start_date: str | None = None, end_date: str | None = None):
-        params = {"start_date": start_date, "end_date": end_date}
-        return self._cached_call(
-            "macro_indicators",
-            params,
-            lambda: self.provider.get_macro_indicators(start_date=start_date, end_date=end_date),
-        )
+        source_policy_version = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"
+        dataset_key = f"{source_policy_version}__master"
+        params = {
+            "scope": "master",
+            "source_policy_version": source_policy_version,
+        }
+        cached = self.cache.get("macro_indicators", params, ttl_seconds=self.ttl_seconds)
+        payload = cached if isinstance(cached, dict) else None
+        cached_updated_at = self.cache.get_request_updated_at("macro_indicators", params)
+        today = date.today()
+
+        # Request-cache miss fallback: restore latest master snapshot from dataset history.
+        if payload is None and cached_updated_at is None:
+            history = self.cache.get_dataset("macro_indicators_history", dataset_key) or []
+            if isinstance(history, list):
+                candidates = [item for item in history if isinstance(item, dict)]
+                if candidates:
+                    candidates = sorted(candidates, key=lambda x: str(x.get("snapshot_at", "")))
+                    payload = candidates[-1]
+                    self.cache.set("macro_indicators", params, payload)
+                    cached_updated_at = self.cache.get_request_updated_at("macro_indicators", params)
+                    logger.info(
+                        "Macro request cache restored from dataset master snapshot. snapshot_at=%s",
+                        str(payload.get("snapshot_at", "")),
+                    )
+
+        # Series-level refresh policy:
+        # - derive staleness from latest observation date + expected update cycle per series
+        # - refresh only stale keys when subset endpoint is available
+        if isinstance(payload, dict) and cached_updated_at is not None:
+            has_non_empty = self._is_non_empty_macro_payload(payload)
+            stale_keys = self._macro_stale_keys(payload, as_of=today)
+            if has_non_empty and not stale_keys:
+                logger.info(
+                    "Macro fetch skipped: all series within expected update cycles. window=%s~%s",
+                    start_date,
+                    end_date,
+                )
+                return self._filter_macro_payload_window(payload, start_date, end_date)
+            if has_non_empty and stale_keys:
+                # Avoid repeated expensive refresh loops when providers return no data delta.
+                # If this master cache file was just refreshed, serve local data directly.
+                if (datetime.now() - cached_updated_at) < timedelta(days=1):
+                    logger.info(
+                        "Macro stale refresh skipped: master cache refreshed within 24h. stale=%d window=%s~%s",
+                        len(stale_keys),
+                        start_date,
+                        end_date,
+                    )
+                    return self._filter_macro_payload_window(payload, start_date, end_date)
+            if stale_keys:
+                if hasattr(self.provider, "get_macro_indicators_subset"):
+                    logger.info(
+                        "Macro master cache has stale series; refreshing subset only. stale=%d window=%s~%s",
+                        len(stale_keys),
+                        start_date,
+                        end_date,
+                    )
+                    try:
+                        fetch_subset = getattr(self.provider, "get_macro_indicators_subset")
+                        partial = fetch_subset(series_keys=stale_keys, start_date=None, end_date=None)
+                        if isinstance(partial, dict):
+                            before = payload
+                            payload = self._merge_macro_payloads(payload or {}, partial)
+                            self.cache.set("macro_indicators", params, payload)
+                            summary = self._macro_update_summary(before, payload)
+                            if summary:
+                                logger.info("Macro missing-series refresh updated: %s", summary)
+                            else:
+                                logger.info("Macro missing-series refresh had no data delta.")
+                            return self._filter_macro_payload_window(payload, start_date, end_date)
+                    except Exception:
+                        logger.exception("Macro subset refresh failed; fallback to full refresh.")
+                logger.info(
+                    "Macro master cache has stale series and subset refresh unavailable; forcing full refresh. "
+                    "stale=%d window=%s~%s",
+                    len(stale_keys),
+                    start_date,
+                    end_date,
+                )
+
+        try:
+            # Always refresh the master database using full available history; query windows are subsets.
+            fresh = self.provider.get_macro_indicators(start_date=None, end_date=None)
+            if isinstance(fresh, dict):
+                before = payload
+                payload = self._merge_macro_payloads(payload or {}, fresh)
+                self.cache.set("macro_indicators", params, payload)
+                summary = self._macro_update_summary(before, payload)
+                if summary:
+                    logger.info("Macro master data updated. query_window=%s~%s series=%s", start_date, end_date, summary)
+                else:
+                    logger.info("Macro master fetch completed with no data delta. query_window=%s~%s", start_date, end_date)
+        except Exception:
+            if payload is None:
+                raise
+
+        # Persist immutable snapshots for longitudinal analysis/tracking.
+        if isinstance(payload, dict):
+            snapshot_at = str(payload.get("snapshot_at", ""))
+            history = self.cache.get_dataset("macro_indicators_history", dataset_key) or []
+            if isinstance(history, list):
+                already = any(
+                    isinstance(item, dict) and str(item.get("snapshot_at", "")) == snapshot_at
+                    for item in history
+                )
+                if not already:
+                    history.append(payload)
+                    history = history[-500:]
+                    self.cache.set_dataset("macro_indicators_history", dataset_key, history)
+        return self._filter_macro_payload_window(payload, start_date, end_date)
+
+    def get_macro_indicators_structured(self, start_date: str | None = None, end_date: str | None = None):
+        from ..unified_api import structure_macro_indicators
+
+        raw = self.get_macro_indicators(start_date=start_date, end_date=end_date)
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+            "view": "structured_v1",
+        }
+        cached = self.cache.get("macro_indicators_structured", params, ttl_seconds=self.ttl_seconds)
+        if isinstance(cached, dict):
+            return cached
+        structured = structure_macro_indicators(raw if isinstance(raw, dict) else {})
+        self.cache.set("macro_indicators_structured", params, structured)
+        return structured
 
     def get_company_news(
         self,

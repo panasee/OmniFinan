@@ -15,7 +15,11 @@ APIs, but ensures the output structure remains consistent.
 """
 
 import json
+import os
 import re
+import warnings
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from io import StringIO
 from datetime import date, datetime, timedelta
 from typing import Any, Literal  # Added Any for flexibility with model fields
 
@@ -193,15 +197,25 @@ def _infer_date_and_value_columns(df: pd.DataFrame) -> tuple[str | None, str | N
     best_date_count = -1
     best_value_count = -1
 
-    for col in df.columns:
-        parsed_dates = pd.to_datetime(df[col], errors="coerce")
-        date_count = int(parsed_dates.notna().sum())
+    sample = df.head(300)
+    for col in sample.columns:
+        s = sample[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            date_count = int(s.notna().sum())
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                parsed_dates = pd.to_datetime(s, errors="coerce")
+            date_count = int(parsed_dates.notna().sum())
         if date_count > best_date_count:
             best_date_count = date_count
             date_col = col
 
-        parsed_numbers = pd.to_numeric(df[col], errors="coerce")
-        value_count = int(parsed_numbers.notna().sum())
+        if pd.api.types.is_numeric_dtype(s):
+            value_count = int(s.notna().sum())
+        else:
+            parsed_numbers = pd.to_numeric(s, errors="coerce")
+            value_count = int(parsed_numbers.notna().sum())
         if value_count > best_value_count:
             best_value_count = value_count
             value_col = col
@@ -235,7 +249,10 @@ def _normalize_macro_series(
             "error": "empty dataframe",
         }
 
-    local_date_col, local_value_col = _infer_date_and_value_columns(df)
+    local_date_col = None
+    local_value_col = None
+    if date_col is None or value_col is None:
+        local_date_col, local_value_col = _infer_date_and_value_columns(df)
     use_date_col = date_col or local_date_col
     use_value_col = value_col or local_value_col
     if use_date_col is None or use_value_col is None:
@@ -251,9 +268,10 @@ def _normalize_macro_series(
 
     work = df[[use_date_col, use_value_col]].copy()
     work.columns = ["date", "value"]
-    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["date"] = _coerce_macro_date_series(work["date"])
     work["value"] = pd.to_numeric(work["value"], errors="coerce")
     work = work.dropna(subset=["date", "value"]).sort_values("date")
+    full_work = work.copy()
 
     if start_date:
         start_dt = pd.to_datetime(start_date, errors="coerce")
@@ -263,6 +281,10 @@ def _normalize_macro_series(
         end_dt = pd.to_datetime(end_date, errors="coerce")
         if pd.notna(end_dt):
             work = work[work["date"] <= end_dt]
+
+    if work.empty and not full_work.empty:
+        # Keep data continuity for low-frequency series even when caller window is narrow.
+        work = full_work.tail(24).copy()
 
     observations = [
         {"date": ts.strftime("%Y-%m-%d"), "value": float(val)}
@@ -277,7 +299,7 @@ def _normalize_macro_series(
         elif latest["value"] < previous["value"]:
             trend = "down"
 
-    return {
+    payload = {
         "series": series_name,
         "source": source,
         "observations": observations,
@@ -286,179 +308,1639 @@ def _normalize_macro_series(
         "trend": trend,
         "error": None,
     }
+    if observations and (start_date or end_date) and full_work.shape[0] > work.shape[0]:
+        payload["note"] = "window_filtered_or_fallback_latest_used"
+    return payload
 
 
-def _fetch_sofr_series(
+MACRO_SOURCE_POLICY_VERSION = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"
+
+
+def _coerce_macro_date_series(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s, errors="coerce")
+    raw = s.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    # 1) YYYYMMDD
+    m = raw.str.fullmatch(r"\d{8}")
+    if m.any():
+        out.loc[m] = pd.to_datetime(raw.loc[m], format="%Y%m%d", errors="coerce")
+
+    # 2) YYYYMM
+    m = raw.str.fullmatch(r"\d{6}")
+    if m.any():
+        out.loc[m] = pd.to_datetime(raw.loc[m] + "01", format="%Y%m%d", errors="coerce")
+
+    # 3) YYYY-MM / YYYY/MM
+    m = raw.str.fullmatch(r"\d{4}[-/]\d{1,2}")
+    if m.any():
+        norm = raw.loc[m].str.replace("/", "-", regex=False) + "-01"
+        out.loc[m] = pd.to_datetime(norm, format="%Y-%m-%d", errors="coerce")
+
+    # 4) YYYY年MM月份 / YYYY年MM月
+    m = raw.str.fullmatch(r"\d{4}年\d{1,2}(月份|月)")
+    if m.any():
+        norm = (
+            raw.loc[m]
+            .str.replace("年份", "年", regex=False)
+            .str.replace("月份", "月", regex=False)
+            .str.replace("年", "-", regex=False)
+            .str.replace("月", "-01", regex=False)
+        )
+        out.loc[m] = pd.to_datetime(norm, format="%Y-%m-%d", errors="coerce")
+
+    # 5) YYYY年M-N月 -> use N month
+    m = raw.str.fullmatch(r"\d{4}年\d{1,2}-\d{1,2}月")
+    if m.any():
+        extracted = raw.loc[m].str.extract(r"(?P<y>\d{4})年(?P<m1>\d{1,2})-(?P<m2>\d{1,2})月")
+        norm = extracted["y"] + "-" + extracted["m2"].str.zfill(2) + "-01"
+        out.loc[m] = pd.to_datetime(norm, format="%Y-%m-%d", errors="coerce")
+
+    # 6) fallback parser without warning spam
+    rest = out.isna()
+    if rest.any():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            out.loc[rest] = pd.to_datetime(raw.loc[rest], errors="coerce")
+    return out
+
+
+def _macro_error_payload(series_name: str, source: str, error: str) -> dict[str, Any]:
+    return {
+        "series": series_name,
+        "source": source,
+        "observations": [],
+        "latest": None,
+        "previous": None,
+        "trend": "flat",
+        "error": error,
+    }
+
+
+def _get_fred_api_key() -> str | None:
+    env_key = os.getenv("FRED_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        from .data.providers.credentials import get_api_key, load_provider_credentials
+
+        cfg_key = get_api_key("fred")
+        if cfg_key:
+            return cfg_key
+
+        payload = load_provider_credentials()
+        if isinstance(payload, dict):
+            for key_name in ("fred_api_key", "FRED_API_KEY"):
+                raw = payload.get(key_name)
+                if isinstance(raw, str) and raw.strip():
+                    return raw.strip()
+            node = payload.get("fred")
+            if isinstance(node, dict):
+                raw = node.get("key")
+                if isinstance(raw, str) and raw.strip():
+                    return raw.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _fred_fetch_series(
+    *,
+    series_name: str,
+    series_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    transform: str | None = None,
+) -> dict[str, Any]:
+    source = f"fred:{series_id}"
+    params: dict[str, Any] = {"series_id": series_id, "file_type": "json"}
+    api_key = _get_fred_api_key()
+    if api_key:
+        params["api_key"] = api_key
+    if start_date:
+        params["observation_start"] = start_date
+    if end_date:
+        params["observation_end"] = end_date
+    def _finalize(df: pd.DataFrame) -> dict[str, Any]:
+        if df.empty:
+            return _macro_error_payload(series_name, source, "empty FRED response")
+        if transform == "yoy":
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date")
+            df["value"] = (df["value"] / df["value"].shift(12) - 1.0) * 100.0
+            df = df.dropna(subset=["value"])
+            df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+        return _normalize_macro_series(
+            df,
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col="date",
+            value_col="value",
+        )
+
+    # Primary: FRED JSON API
+    try:
+        resp = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params=params,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = payload.get("observations", [])
+        clean_rows: list[dict[str, Any]] = []
+        for row in rows:
+            raw_value = row.get("value")
+            if raw_value in (None, ".", ""):
+                continue
+            try:
+                clean_rows.append({"date": str(row.get("date")), "value": float(raw_value)})
+            except (TypeError, ValueError):
+                continue
+        return _finalize(pd.DataFrame(clean_rows))
+    except Exception as exc:
+        logger.warning("FRED JSON fetch failed for %s(%s): %s", series_name, series_id, exc)
+
+    # Fallback: official FRED graph CSV endpoint (works in environments where JSON API rejects requests).
+    try:
+        csv_params: dict[str, Any] = {"id": series_id}
+        if start_date:
+            csv_params["cosd"] = start_date
+        if end_date:
+            csv_params["coed"] = end_date
+        resp_csv = requests.get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv",
+            params=csv_params,
+            timeout=20,
+        )
+        resp_csv.raise_for_status()
+        df = pd.read_csv(
+            StringIO(resp_csv.text),
+            dtype=str,
+        )
+        if df.empty or "DATE" not in df.columns:
+            return _macro_error_payload(series_name, source, "unexpected FRED CSV response")
+        value_col = next((c for c in df.columns if c != "DATE"), None)
+        if value_col is None:
+            return _macro_error_payload(series_name, source, "FRED CSV missing value column")
+        df = df.rename(columns={"DATE": "date", value_col: "value"})
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["value"])
+        return _finalize(df[["date", "value"]].copy())
+    except Exception as exc:
+        logger.warning("FRED CSV fallback failed for %s(%s): %s", series_name, series_id, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _world_bank_fetch_series(
+    *,
+    series_name: str,
+    indicator: str,
+    country: str = "USA",
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch SOFR from New York Fed public endpoint."""
-    start = start_date or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    end = end_date or datetime.now().strftime("%Y-%m-%d")
-    url = (
-        "https://markets.newyorkfed.org/api/rates/secured/sofr/search.json"
-        f"?startDate={start}&endDate={end}&type=rate"
-    )
+    source = f"world_bank:{country}:{indicator}"
     try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
-        rows = payload.get("refRates", [])
-        df = pd.DataFrame(rows)
+        resp = requests.get(
+            f"https://api.worldbank.org/v2/country/{country}/indicator/{indicator}",
+            params={"format": "json", "per_page": 20000},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list) or len(payload) < 2 or not isinstance(payload[1], list):
+            return _macro_error_payload(series_name, source, "unexpected World Bank response")
+        rows = payload[1]
+        parsed: list[dict[str, Any]] = []
+        for row in rows:
+            year = row.get("date")
+            value = row.get("value")
+            if year in (None, "") or value in (None, ""):
+                continue
+            try:
+                parsed.append({"date": f"{int(year):04d}-12-31", "value": float(value)})
+            except (TypeError, ValueError):
+                continue
+        df = pd.DataFrame(parsed)
         if df.empty:
-            return {
-                "series": "sofr",
-                "source": "nyfed",
-                "observations": [],
-                "latest": None,
-                "previous": None,
-                "trend": "flat",
-                "error": "empty SOFR response",
-            }
+            return _macro_error_payload(series_name, source, "empty World Bank response")
         return _normalize_macro_series(
             df,
-            series_name="sofr",
-            source="nyfed",
+            series_name=series_name,
+            source=source,
             start_date=start_date,
             end_date=end_date,
-            date_col="effectiveDate",
-            value_col="percentRate",
+            date_col="date",
+            value_col="value",
         )
     except Exception as exc:
-        logger.warning("SOFR fetch failed: %s", exc)
-        return {
-            "series": "sofr",
-            "source": "nyfed",
-            "observations": [],
-            "latest": None,
-            "previous": None,
-            "trend": "flat",
-            "error": str(exc),
-        }
+        logger.warning("World Bank fetch failed for %s(%s): %s", series_name, indicator, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _imf_fetch_series(
+    *,
+    series_name: str,
+    indicator: str,
+    country: str = "USA",
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    source = f"imf_datamapper:{indicator}:{country}"
+    try:
+        resp = requests.get(
+            f"https://www.imf.org/external/datamapper/api/v1/{indicator}/{country}",
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        values = payload.get("values", {})
+        indicator_map = values.get(indicator, {})
+        country_map = indicator_map.get(country, {})
+        parsed: list[dict[str, Any]] = []
+        for year, value in country_map.items():
+            if value in (None, ""):
+                continue
+            try:
+                parsed.append({"date": f"{int(year):04d}-12-31", "value": float(value)})
+            except (TypeError, ValueError):
+                continue
+        df = pd.DataFrame(parsed)
+        if df.empty:
+            return _macro_error_payload(series_name, source, "empty IMF response")
+        return _normalize_macro_series(
+            df,
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col="date",
+            value_col="value",
+        )
+    except Exception as exc:
+        logger.warning("IMF fetch failed for %s(%s): %s", series_name, indicator, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _akshare_fetch_series(
+    *,
+    series_name: str,
+    fetcher_name: str,
+    source: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    date_col: str | None = None,
+    value_col: str | None = None,
+) -> dict[str, Any]:
+    fetcher = getattr(ak, fetcher_name, None)
+    if fetcher is None:
+        return _macro_error_payload(series_name, source, f"akshare fetcher unavailable: {fetcher_name}")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(fetcher)
+            df = fut.result(timeout=300)
+        if series_name == "china_urban_unemployment" and {"item", "value", "date"}.issubset(set(df.columns)):
+            mask = df["item"].astype(str).str.contains("全国城镇调查失业率", na=False)
+            if mask.any():
+                df = df.loc[mask, ["date", "value"]].copy()
+        use_date_col = date_col
+        use_value_col = value_col
+        if series_name == "china_shibor_3m":
+            use_date_col = next(
+                (col for col in df.columns if str(col).upper() in {"DATE", "日期", "TRADE_DATE"}),
+                None,
+            )
+            use_value_col = next((col for col in df.columns if "3M" in str(col).upper()), None)
+        return _normalize_macro_series(
+            df,
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col=use_date_col,
+            value_col=use_value_col,
+        )
+    except FuturesTimeoutError:
+        logger.warning("AkShare macro fetch timed out for %s via %s", series_name, fetcher_name)
+        return _macro_error_payload(series_name, source, "timeout")
+    except Exception as exc:
+        logger.warning("AkShare macro fetch failed for %s via %s: %s", series_name, fetcher_name, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _payload_has_observations(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    obs = payload.get("observations", [])
+    return isinstance(obs, list) and len(obs) > 0 and payload.get("error") is None
+
+
+def _first_non_empty_payload(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    for payload in candidates:
+        if _payload_has_observations(payload):
+            return payload
+    return candidates[0] if candidates else _macro_error_payload("unknown", "unknown", "no payload candidates")
+
+
+def _mas_fetch_sg_10y_yield(
+    *,
+    series_name: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    source = "mas:sgs_original_maturity_10y"
+    try:
+        resp = requests.get(
+            "https://eservices.mas.gov.sg/statistics/fdanet/BondOriginalMaturities.aspx?type=NX",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+        if not tables:
+            return _macro_error_payload(series_name, source, "empty MAS table")
+        df = tables[0]
+        # Flatten two-level headers (Yield/Price columns per issue).
+        if isinstance(df.columns, pd.MultiIndex):
+            flat_cols = []
+            for lv0, lv1 in df.columns:
+                a = str(lv0).strip()
+                b = str(lv1).strip()
+                flat_cols.append(f"{a}|{b}" if b and b.lower() != "nan" else a)
+            df.columns = flat_cols
+        else:
+            df.columns = [str(c).strip() for c in df.columns]
+
+        date_col = next((c for c in df.columns if "Issue Code" in c), None)
+        if date_col is None:
+            date_col = df.columns[0]
+        yield_cols = [c for c in df.columns if str(c).strip().endswith("|Yield") or str(c).strip() == "Yield"]
+        if not yield_cols:
+            yield_cols = [c for c in df.columns if "Yield" in str(c)]
+        if not yield_cols:
+            return _macro_error_payload(series_name, source, "MAS 10Y page missing yield columns")
+
+        work = pd.DataFrame()
+        work["date"] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+        ymat = df[yield_cols].apply(pd.to_numeric, errors="coerce")
+        work["value"] = ymat.mean(axis=1, skipna=True)
+        work = work.dropna(subset=["date", "value"]).sort_values("date")
+        if work.empty:
+            return _macro_error_payload(series_name, source, "MAS 10Y page parsed empty")
+        work["date"] = work["date"].dt.strftime("%Y-%m-%d")
+        return _normalize_macro_series(
+            work[["date", "value"]],
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col="date",
+            value_col="value",
+        )
+    except Exception as exc:
+        logger.warning("MAS SG 10Y fetch failed for %s: %s", series_name, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _parse_ism_month_label(label: str, *, index_hint: int) -> str | None:
+    raw = str(label).strip()
+    if not raw:
+        return None
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.notna(parsed):
+        return parsed.strftime("%Y-%m-%d")
+    # Fallback for labels like "January"/"Jan" without explicit year.
+    months = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    token = raw[:3].lower()
+    month = months.get(token)
+    if month is None:
+        return None
+    # Infer year by walking backwards from current month for 12M history tables.
+    today = date.today()
+    year = today.year
+    if month > today.month:
+        year -= 1
+    # index_hint handles same-month labels in older rows.
+    year -= index_hint // 12
+    return f"{year:04d}-{month:02d}-01"
+
+
+def _extract_ism_table_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if df is None or df.empty:
+        return rows
+
+    work = df.copy()
+    work.columns = [str(c).strip() for c in work.columns]
+    lc_cols = [c.lower() for c in work.columns]
+
+    # Long format: has a month/date column and a PMI column.
+    pmi_col = next((c for c in work.columns if "pmi" in c.lower()), None)
+    date_col = next((c for c in work.columns if any(k in c.lower() for k in ("month", "date"))), None)
+    if pmi_col and date_col:
+        for i, row in work.iterrows():
+            raw_value = pd.to_numeric(row.get(pmi_col), errors="coerce")
+            if pd.isna(raw_value):
+                continue
+            d = _parse_ism_month_label(str(row.get(date_col)), index_hint=int(i))
+            if d is None:
+                continue
+            rows.append({"date": d, "value": float(raw_value)})
+        return rows
+
+    # Wide format: first column is row label, one row named PMI and month columns in header.
+    if work.shape[1] >= 3 and not any("pmi" in c for c in lc_cols):
+        label_col = work.columns[0]
+        pmi_row = None
+        for _, row in work.iterrows():
+            label = str(row.get(label_col, "")).lower()
+            if "pmi" in label:
+                pmi_row = row
+                break
+        if pmi_row is not None:
+            month_cols = work.columns[1:]
+            for i, col in enumerate(month_cols):
+                raw_value = pd.to_numeric(pmi_row.get(col), errors="coerce")
+                if pd.isna(raw_value):
+                    continue
+                d = _parse_ism_month_label(str(col), index_hint=i)
+                if d is None:
+                    continue
+                rows.append({"date": d, "value": float(raw_value)})
+            return rows
+    return rows
+
+
+def _ism_fetch_series(
+    *,
+    series_name: str,
+    report_type: Literal["manufacturing", "services"],
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    source = f"ism_public:{report_type}"
+    month_names = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ]
+    today = date.today()
+    idx = today.month - 1
+    prev_idx = (idx - 1) % 12
+    base = (
+        "https://www.ismworld.org/supply-management-news-and-reports/reports/ism-pmi-reports/pmi/"
+        if report_type == "manufacturing"
+        else "https://www.ismworld.org/supply-management-news-and-reports/reports/ism-pmi-reports/services/"
+    )
+    urls = [f"{base}{month_names[idx]}/", f"{base}{month_names[prev_idx]}/"]
+    try:
+        tables = []
+        last_exc: Exception | None = None
+        for url in urls:
+            try:
+                resp = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    },
+                    timeout=25,
+                )
+                resp.raise_for_status()
+                tables = pd.read_html(StringIO(resp.text))
+                if tables:
+                    break
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if not tables:
+            if last_exc:
+                return _macro_error_payload(series_name, source, str(last_exc))
+            return _macro_error_payload(series_name, source, "ISM table not found")
+        parsed_rows: list[dict[str, Any]] = []
+        for table in tables:
+            parsed_rows.extend(_extract_ism_table_rows(table))
+        if not parsed_rows:
+            return _macro_error_payload(series_name, source, "ISM PMI rows not parsed")
+        df = pd.DataFrame(parsed_rows).drop_duplicates(subset=["date"]).sort_values("date")
+        return _normalize_macro_series(
+            df,
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col="date",
+            value_col="value",
+        )
+    except Exception as exc:
+        logger.warning("ISM fetch failed for %s(%s): %s", series_name, report_type, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _load_us_pmi_local_series(
+    *,
+    series_name: str,
+    bucket: Literal["service", "manufacturing"],
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    source = f"local:us_pmi_json:{bucket}"
+    p = OMNIX_PATH / "omnifinan" / "datasets" / "macro_indicators_history" / "us_pmi.json"
+    if not p.exists():
+        return _macro_error_payload(series_name, source, f"missing file: {p}")
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        rows = payload.get(bucket, []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return _macro_error_payload(series_name, source, f"invalid bucket type: {bucket}")
+        parsed: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            d = row.get("date")
+            v = row.get("value")
+            if d in (None, "") or v in (None, ""):
+                continue
+            try:
+                parsed.append({"date": str(d), "value": float(v)})
+            except (TypeError, ValueError):
+                continue
+        if not parsed:
+            return _macro_error_payload(series_name, source, f"empty or invalid rows for {bucket}")
+        df = pd.DataFrame(parsed).drop_duplicates(subset=["date"]).sort_values("date")
+        return _normalize_macro_series(
+            df,
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col="date",
+            value_col="value",
+        )
+    except Exception as exc:
+        return _macro_error_payload(series_name, source, str(exc))
+
+
+def _load_us_pmi_series_with_fallback(
+    *,
+    series_name: str,
+    ak_fetcher: str,
+    local_bucket: Literal["service", "manufacturing"],
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    primary = _akshare_fetch_series(
+        series_name=series_name,
+        fetcher_name=ak_fetcher,
+        source=f"akshare:us_macro:{ak_fetcher}",
+        start_date=start_date,
+        end_date=end_date,
+        date_col="日期",
+        value_col="今值",
+    )
+    if _payload_has_observations(primary):
+        return primary
+    fallback = _load_us_pmi_local_series(
+        series_name=series_name,
+        bucket=local_bucket,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _payload_has_observations(fallback):
+        return fallback
+    return primary
+
+
+def _payload_latest_date(payload: dict[str, Any] | None) -> date | None:
+    if not isinstance(payload, dict):
+        return None
+    latest = payload.get("latest")
+    if isinstance(latest, dict):
+        d = latest.get("date")
+        if isinstance(d, str):
+            for fmt in ("%Y-%m-%d", "%Y%m%d"):
+                try:
+                    return datetime.strptime(d[:10], fmt).date()
+                except Exception:
+                    continue
+    return None
+
+
+def _derived_growth_from_level_payload(
+    base_payload: dict[str, Any],
+    *,
+    series_name: str,
+    periods: int,
+    source: str,
+    annualize: bool = False,
+) -> dict[str, Any]:
+    obs = base_payload.get("observations", []) if isinstance(base_payload, dict) else []
+    if not isinstance(obs, list) or not obs:
+        return _macro_error_payload(series_name, source, "base observations unavailable")
+    rows = []
+    for row in obs:
+        if not isinstance(row, dict):
+            continue
+        d = row.get("date")
+        v = row.get("value")
+        if d is None or v is None:
+            continue
+        rows.append({"date": d, "value": v})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return _macro_error_payload(series_name, source, "base observations unavailable")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["date", "value"]).sort_values("date")
+    pct = df["value"].pct_change(periods=periods)
+    if annualize:
+        pct = ((1.0 + pct) ** 4) - 1.0
+    df["value"] = pct * 100.0
+    df = df.dropna(subset=["value"])
+    if df.empty:
+        return _macro_error_payload(series_name, source, "insufficient history for growth calculation")
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    return _normalize_macro_series(
+        df[["date", "value"]],
+        series_name=series_name,
+        source=source,
+        date_col="date",
+        value_col="value",
+    )
+
+
+def _clone_series_payload(base_payload: dict[str, Any], *, series_name: str, source: str) -> dict[str, Any]:
+    if not isinstance(base_payload, dict):
+        return _macro_error_payload(series_name, source, "base payload unavailable")
+    cloned = dict(base_payload)
+    cloned["series"] = series_name
+    cloned["source"] = source
+    return cloned
 
 
 def get_macro_indicators(
     start_date: str | None = None,
     end_date: str | None = None,
+    include_series: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Fetch major macro indicators used in top-down financial analysis.
+    """Fetch macro indicators with fixed source policy.
 
-    Indicator coverage (when available from current AkShare version):
-    - Policy/liquidity: Fed policy rate, PBOC policy rate, China LPR, China SHIBOR 3M, SOFR
-    - Inflation: US CPI YoY, US core PCE, China CPI YoY, China PPI YoY
-    - Growth/activity: US GDP, US ISM PMI, US retail sales, China GDP YoY, China PMI (manufacturing/non-manufacturing)
-    - Labor: US unemployment, US non-farm payrolls, US initial jobless claims, China urban unemployment
-    - External/credit: China M2 YoY, exports YoY, imports YoY, trade balance, FX reserves
+    Fixed sources:
+    - China: AkShare wrappers for official China sources (NBS/PBOC/SAFE, etc.)
+    - International: FRED / IMF / World Bank only
     """
     results: dict[str, Any] = {"series": {}}
-    fetch_specs = {
-        # US policy + inflation + activity + labor
-        "fed_policy_rate": {"source": "akshare", "fetcher_name": "macro_bank_usa_interest_rate"},
-        "us_cpi_yoy": {"source": "akshare", "fetcher_name": "macro_usa_cpi_yoy"},
-        "us_core_pce_price": {"source": "akshare", "fetcher_name": "macro_usa_core_pce_price"},
-        "us_unemployment_rate": {"source": "akshare", "fetcher_name": "macro_usa_unemployment_rate"},
-        "us_non_farm_payrolls": {"source": "akshare", "fetcher_name": "macro_usa_non_farm"},
-        "us_initial_jobless_claims": {"source": "akshare", "fetcher_name": "macro_usa_initial_jobless"},
-        "us_ism_pmi": {"source": "akshare", "fetcher_name": "macro_usa_ism_pmi"},
-        "us_retail_sales": {"source": "akshare", "fetcher_name": "macro_usa_retail_sales"},
-        "us_gdp_growth": {"source": "akshare", "fetcher_name": "macro_usa_gdp_monthly"},
-        "us_industrial_production": {"source": "akshare", "fetcher_name": "macro_usa_industrial_production"},
-        # China policy + inflation + activity + labor + external
-        "pboc_policy_rate": {"source": "akshare", "fetcher_name": "macro_bank_china_interest_rate"},
-        "china_lpr_1y": {
-            "source": "akshare",
+    include = set(include_series) if include_series else None
+
+    def _want(key: str) -> bool:
+        return include is None or key in include
+
+    # International: FRED / IMF / World Bank (fixed)
+    if _want("fed_policy_rate"):
+        results["series"]["fed_policy_rate"] = _fred_fetch_series(
+            series_name="fed_policy_rate",
+            series_id="FEDFUNDS",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("sofr"):
+        results["series"]["sofr"] = _fred_fetch_series(
+            series_name="sofr",
+            series_id="SOFR",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_cpi_yoy"):
+        results["series"]["us_cpi_yoy"] = _fred_fetch_series(
+            series_name="us_cpi_yoy",
+            series_id="CPIAUCSL",
+            start_date=start_date,
+            end_date=end_date,
+            transform="yoy",
+        )
+    if _want("us_core_pce_price"):
+        results["series"]["us_core_pce_price"] = _fred_fetch_series(
+            series_name="us_core_pce_price",
+            series_id="PCEPILFE",
+            start_date=start_date,
+            end_date=end_date,
+            transform="yoy",
+        )
+    if _want("us_unemployment_rate"):
+        results["series"]["us_unemployment_rate"] = _fred_fetch_series(
+            series_name="us_unemployment_rate",
+            series_id="UNRATE",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_non_farm_payrolls"):
+        results["series"]["us_non_farm_payrolls"] = _fred_fetch_series(
+            series_name="us_non_farm_payrolls",
+            series_id="PAYEMS",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_initial_jobless_claims"):
+        results["series"]["us_initial_jobless_claims"] = _fred_fetch_series(
+            series_name="us_initial_jobless_claims",
+            series_id="ICSA",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_retail_sales"):
+        results["series"]["us_retail_sales"] = _fred_fetch_series(
+            series_name="us_retail_sales",
+            series_id="RSAFS",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_consumer_confidence_cb"):
+        results["series"]["us_consumer_confidence_cb"] = _akshare_fetch_series(
+            series_name="us_consumer_confidence_cb",
+            fetcher_name="macro_usa_cb_consumer_confidence",
+            source="akshare:us_macro:macro_usa_cb_consumer_confidence",
+            start_date=start_date,
+            end_date=end_date,
+            date_col="日期",
+            value_col="今值",
+        )
+    if _want("us_consumer_sentiment_michigan"):
+        results["series"]["us_consumer_sentiment_michigan"] = _akshare_fetch_series(
+            series_name="us_consumer_sentiment_michigan",
+            fetcher_name="macro_usa_michigan_consumer_sentiment",
+            source="akshare:us_macro:macro_usa_michigan_consumer_sentiment",
+            start_date=start_date,
+            end_date=end_date,
+            date_col="日期",
+            value_col="今值",
+        )
+    if _want("us_industrial_production"):
+        results["series"]["us_industrial_production"] = _fred_fetch_series(
+            series_name="us_industrial_production",
+            series_id="INDPRO",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    need_gdp_level = any(
+        _want(k)
+        for k in ("us_real_gdp_latest_quarter", "us_real_gdp_qoq_annualized", "us_real_gdp_yoy", "us_gdp_growth")
+    )
+    us_real_gdp_level = None
+    if need_gdp_level:
+        us_real_gdp_level = _fred_fetch_series(
+            series_name="us_real_gdp_latest_quarter",
+            series_id="GDPC1",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_real_gdp_latest_quarter") and us_real_gdp_level is not None:
+        results["series"]["us_real_gdp_latest_quarter"] = us_real_gdp_level
+    if _want("us_real_gdp_qoq_annualized") and us_real_gdp_level is not None:
+        results["series"]["us_real_gdp_qoq_annualized"] = _derived_growth_from_level_payload(
+            us_real_gdp_level,
+            series_name="us_real_gdp_qoq_annualized",
+            periods=1,
+            source="derived:fred:GDPC1:qoq_annualized",
+            annualize=True,
+        )
+    if _want("us_real_gdp_yoy") and us_real_gdp_level is not None:
+        results["series"]["us_real_gdp_yoy"] = _derived_growth_from_level_payload(
+            us_real_gdp_level,
+            series_name="us_real_gdp_yoy",
+            periods=4,
+            source="derived:fred:GDPC1:yoy",
+        )
+    if _want("us_core_cpi_yoy"):
+        results["series"]["us_core_cpi_yoy"] = _fred_fetch_series(
+        series_name="us_core_cpi_yoy",
+        series_id="CPILFESL",
+        start_date=start_date,
+        end_date=end_date,
+        transform="yoy",
+    )
+    if _want("us_breakeven_10y"):
+        results["series"]["us_breakeven_10y"] = _fred_fetch_series(
+        series_name="us_breakeven_10y",
+        series_id="T10YIE",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_m2"):
+        results["series"]["us_m2"] = _fred_fetch_series(
+        series_name="us_m2",
+        series_id="M2SL",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_central_bank_total_assets"):
+        results["series"]["us_central_bank_total_assets"] = _fred_fetch_series(
+        series_name="us_central_bank_total_assets",
+        series_id="WALCL",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_real_rate_10y"):
+        results["series"]["us_real_rate_10y"] = _fred_fetch_series(
+        series_name="us_real_rate_10y",
+        series_id="DFII10",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_treasury_2y"):
+        results["series"]["us_treasury_2y"] = _fred_fetch_series(
+        series_name="us_treasury_2y",
+        series_id="DGS2",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_treasury_10y"):
+        results["series"]["us_treasury_10y"] = _fred_fetch_series(
+        series_name="us_treasury_10y",
+        series_id="DGS10",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_term_spread_10y_2y"):
+        results["series"]["us_term_spread_10y_2y"] = _fred_fetch_series(
+        series_name="us_term_spread_10y_2y",
+        series_id="T10Y2Y",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_term_spread_10y2y"):
+        if "us_term_spread_10y_2y" in results["series"]:
+            results["series"]["us_term_spread_10y2y"] = _clone_series_payload(
+                results["series"]["us_term_spread_10y_2y"],
+                series_name="us_term_spread_10y2y",
+                source="alias:fred:T10Y2Y",
+            )
+        else:
+            results["series"]["us_term_spread_10y2y"] = _fred_fetch_series(
+                series_name="us_term_spread_10y2y",
+                series_id="T10Y2Y",
+                start_date=start_date,
+                end_date=end_date,
+            )
+    if _want("us_corporate_bbb_oas"):
+        results["series"]["us_corporate_bbb_oas"] = _fred_fetch_series(
+        series_name="us_corporate_bbb_oas",
+        series_id="BAMLC0A4CBBB",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_business_loan_delinquency_rate"):
+        results["series"]["us_business_loan_delinquency_rate"] = _fred_fetch_series(
+        series_name="us_business_loan_delinquency_rate",
+        series_id="DRBLACBS",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_bank_loan_growth_yoy"):
+        us_bank_loan_level = _fred_fetch_series(
+            series_name="us_bank_loans_level",
+            series_id="BUSLOANS",
+            start_date=start_date,
+            end_date=end_date,
+        )
+        results["series"]["us_bank_loan_growth_yoy"] = _derived_growth_from_level_payload(
+            us_bank_loan_level,
+            series_name="us_bank_loan_growth_yoy",
+            periods=12,
+            source="derived:fred:BUSLOANS:yoy",
+        )
+    if _want("us_equity_sp500"):
+        results["series"]["us_equity_sp500"] = _fred_fetch_series(
+        series_name="us_equity_sp500",
+        series_id="SP500",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_vix"):
+        results["series"]["us_vix"] = _fred_fetch_series(
+        series_name="us_vix",
+        series_id="VIXCLS",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("us_dollar_index_broad"):
+        results["series"]["us_dollar_index_broad"] = _fred_fetch_series(
+        series_name="us_dollar_index_broad",
+        series_id="DTWEXBGS",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("commodity_wti_crude"):
+        results["series"]["commodity_wti_crude"] = _fred_fetch_series(
+        series_name="commodity_wti_crude",
+        series_id="DCOILWTICO",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("commodity_copper"):
+        results["series"]["commodity_copper"] = _fred_fetch_series(
+        series_name="commodity_copper",
+        series_id="PCOPPUSDM",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    # Singapore focus (single-source per metric, mostly World Bank + selected FRED FX).
+    if _want("sg_gdp_growth"):
+        results["series"]["sg_gdp_growth"] = _world_bank_fetch_series(
+        series_name="sg_gdp_growth",
+        indicator="NY.GDP.MKTP.KD.ZG",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_gdp_yoy"):
+        if "sg_gdp_growth" in results["series"]:
+            results["series"]["sg_gdp_yoy"] = _clone_series_payload(
+                results["series"]["sg_gdp_growth"],
+                series_name="sg_gdp_yoy",
+                source="alias:world_bank:SGP:NY.GDP.MKTP.KD.ZG",
+            )
+        else:
+            results["series"]["sg_gdp_yoy"] = _world_bank_fetch_series(
+                series_name="sg_gdp_yoy",
+                indicator="NY.GDP.MKTP.KD.ZG",
+                country="SGP",
+                start_date=start_date,
+                end_date=end_date,
+            )
+    if _want("sg_inflation_cpi"):
+        results["series"]["sg_inflation_cpi"] = _world_bank_fetch_series(
+        series_name="sg_inflation_cpi",
+        indicator="FP.CPI.TOTL.ZG",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_cpi_yoy"):
+        if "sg_inflation_cpi" in results["series"]:
+            results["series"]["sg_cpi_yoy"] = _clone_series_payload(
+                results["series"]["sg_inflation_cpi"],
+                series_name="sg_cpi_yoy",
+                source="alias:world_bank:SGP:FP.CPI.TOTL.ZG",
+            )
+        else:
+            results["series"]["sg_cpi_yoy"] = _world_bank_fetch_series(
+                series_name="sg_cpi_yoy",
+                indicator="FP.CPI.TOTL.ZG",
+                country="SGP",
+                start_date=start_date,
+                end_date=end_date,
+            )
+    if _want("sg_industrial_production_yoy"):
+        results["series"]["sg_industrial_production_yoy"] = _macro_error_payload(
+            "sg_industrial_production_yoy",
+            "fixed_sources_unavailable",
+            "unavailable in current fixed providers (AkShare/FRED/IMF/World Bank) for Singapore industrial production YoY",
+        )
+    if _want("sg_unemployment_rate"):
+        results["series"]["sg_unemployment_rate"] = _world_bank_fetch_series(
+        series_name="sg_unemployment_rate",
+        indicator="SL.UEM.TOTL.ZS",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_exports_growth"):
+        results["series"]["sg_exports_growth"] = _world_bank_fetch_series(
+        series_name="sg_exports_growth",
+        indicator="NE.EXP.GNFS.KD.ZG",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_imports_growth"):
+        results["series"]["sg_imports_growth"] = _world_bank_fetch_series(
+        series_name="sg_imports_growth",
+        indicator="NE.IMP.GNFS.KD.ZG",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_current_account_gdp"):
+        results["series"]["sg_current_account_gdp"] = _world_bank_fetch_series(
+        series_name="sg_current_account_gdp",
+        indicator="BN.CAB.XOKA.GD.ZS",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_real_interest_rate"):
+        sg_real_interest_candidates = [
+            _world_bank_fetch_series(
+                series_name="sg_real_interest_rate",
+                indicator="FR.INR.RINR",
+                country="SGP",
+                start_date=start_date,
+                end_date=end_date,
+            ),
+            _world_bank_fetch_series(
+                series_name="sg_real_interest_rate",
+                indicator="FR.INR.LNDP",
+                country="SGP",
+                start_date=start_date,
+                end_date=end_date,
+            ),
+        ]
+        results["series"]["sg_real_interest_rate"] = _first_non_empty_payload(sg_real_interest_candidates)
+    if _want("sg_broad_money_growth"):
+        results["series"]["sg_broad_money_growth"] = _world_bank_fetch_series(
+        series_name="sg_broad_money_growth",
+        indicator="FM.LBL.BMNY.ZG",
+        country="SGP",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("sg_usd_fx"):
+        results["series"]["sg_usd_fx"] = _fred_fetch_series(
+        series_name="sg_usd_fx",
+        series_id="DEXSIUS",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    # Singapore policy-rate proxy fixed to World Bank interest-rate series (best available stable public endpoint).
+    if _want("sg_policy_rate"):
+        sg_policy_candidates = [
+            _world_bank_fetch_series(
+                series_name="sg_policy_rate",
+                indicator="FR.INR.DPST",
+                country="SGP",
+                start_date=start_date,
+                end_date=end_date,
+            ),
+            _world_bank_fetch_series(
+                series_name="sg_policy_rate",
+                indicator="FR.INR.LEND",
+                country="SGP",
+                start_date=start_date,
+                end_date=end_date,
+            ),
+        ]
+        results["series"]["sg_policy_rate"] = _first_non_empty_payload(sg_policy_candidates)
+    # Singapore 10Y yield fixed to MAS SGS original-maturity 10Y page.
+    if _want("sg_government_bond_10y"):
+        results["series"]["sg_government_bond_10y"] = _mas_fetch_sg_10y_yield(
+        series_name="sg_government_bond_10y",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    # Japan/Europe cross-impact liquidity (only high-impact overlap with CN/US/SG).
+    if _want("jp_short_rate_3m"):
+        results["series"]["jp_short_rate_3m"] = _fred_fetch_series(
+        series_name="jp_short_rate_3m",
+        series_id="IR3TIB01JPM156N",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("jp_government_bond_10y"):
+        results["series"]["jp_government_bond_10y"] = _fred_fetch_series(
+        series_name="jp_government_bond_10y",
+        series_id="IRLTLT01JPM156N",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("jp_usd_fx"):
+        results["series"]["jp_usd_fx"] = _fred_fetch_series(
+        series_name="jp_usd_fx",
+        series_id="DEXJPUS",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("eu_short_rate_3m"):
+        results["series"]["eu_short_rate_3m"] = _fred_fetch_series(
+        series_name="eu_short_rate_3m",
+        series_id="IR3TIB01EZM156N",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("eu_government_bond_10y"):
+        results["series"]["eu_government_bond_10y"] = _fred_fetch_series(
+        series_name="eu_government_bond_10y",
+        series_id="IRLTLT01EZM156N",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("eu_usd_fx"):
+        results["series"]["eu_usd_fx"] = _fred_fetch_series(
+        series_name="eu_usd_fx",
+        series_id="DEXUSEU",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("eu_pmi_manufacturing"):
+        results["series"]["eu_pmi_manufacturing"] = _akshare_fetch_series(
+            series_name="eu_pmi_manufacturing",
+            fetcher_name="macro_euro_manufacturing_pmi",
+            source="akshare:eu_macro:macro_euro_manufacturing_pmi",
+            start_date=start_date,
+            end_date=end_date,
+            date_col="日期",
+            value_col="今值",
+        )
+    if _want("jp_policy_rate"):
+        results["series"]["jp_policy_rate"] = _akshare_fetch_series(
+            series_name="jp_policy_rate",
+            fetcher_name="macro_japan_bank_rate",
+            source="akshare:jp_macro:macro_japan_bank_rate",
+            start_date=start_date,
+            end_date=end_date,
+            date_col="时间",
+            value_col="现值",
+        )
+    # Backward-compatible alias: use the same canonical GDP YoY calculation source.
+    if _want("us_gdp_growth"):
+        if "us_real_gdp_yoy" not in results["series"] and us_real_gdp_level is not None:
+            results["series"]["us_real_gdp_yoy"] = _derived_growth_from_level_payload(
+                us_real_gdp_level,
+                series_name="us_real_gdp_yoy",
+                periods=4,
+                source="derived:fred:GDPC1:yoy",
+            )
+        if "us_real_gdp_yoy" in results["series"]:
+            results["series"]["us_gdp_growth"] = _clone_series_payload(
+                results["series"]["us_real_gdp_yoy"],
+                series_name="us_gdp_growth",
+                source="alias:derived:fred:GDPC1:yoy",
+            )
+    if _want("us_real_interest_rate"):
+        if "us_real_rate_10y" in results["series"]:
+            results["series"]["us_real_interest_rate"] = _clone_series_payload(
+                results["series"]["us_real_rate_10y"],
+                series_name="us_real_interest_rate",
+                source="alias:fred:REAINTRATREARAT10Y",
+            )
+        else:
+            results["series"]["us_real_interest_rate"] = _fred_fetch_series(
+                series_name="us_real_interest_rate",
+                series_id="REAINTRATREARAT10Y",
+                start_date=start_date,
+                end_date=end_date,
+            )
+    # US PMI: AkShare official macro endpoints first; local manual file as fallback.
+    if _want("us_pmi_manufacturing"):
+        results["series"]["us_pmi_manufacturing"] = _load_us_pmi_series_with_fallback(
+            series_name="us_pmi_manufacturing",
+            ak_fetcher="macro_usa_ism_pmi",
+            local_bucket="manufacturing",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    if _want("us_pmi_services"):
+        results["series"]["us_pmi_services"] = _load_us_pmi_series_with_fallback(
+            series_name="us_pmi_services",
+            ak_fetcher="macro_usa_ism_non_pmi",
+            local_bucket="service",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    # Global aggregates use World Bank WLD, which is stable for world-level totals/rates.
+    if _want("world_gdp_growth"):
+        results["series"]["world_gdp_growth"] = _world_bank_fetch_series(
+        series_name="world_gdp_growth",
+        indicator="NY.GDP.MKTP.KD.ZG",
+        country="WLD",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if _want("world_inflation"):
+        results["series"]["world_inflation"] = _world_bank_fetch_series(
+        series_name="world_inflation",
+        indicator="FP.CPI.TOTL.ZG",
+        country="WLD",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    # Reserve IMF fetches for Singapore/world extensions to avoid redundant US duplicates here.
+
+    # China: AkShare wrappers for official China data sources (fixed)
+    china_specs = [
+        {
+            "key": "pboc_policy_rate",
+            "fetcher_name": "macro_bank_china_interest_rate",
+            "source": "akshare:china_official:pboc",
+            "date_col": "日期",
+            "value_col": "今值",
+        },
+        {
+            "key": "china_lpr_1y",
             "fetcher_name": "macro_china_lpr",
+            "source": "akshare:china_official:pboc",
             "date_col": "TRADE_DATE",
             "value_col": "LPR1Y",
         },
-        "china_shibor_3m": {"source": "akshare", "fetcher_name": "macro_china_shibor_all"},
-        "china_cpi_yoy": {"source": "akshare", "fetcher_name": "macro_china_cpi_yearly"},
-        "china_ppi_yoy": {"source": "akshare", "fetcher_name": "macro_china_ppi_yearly"},
-        "china_gdp_yoy": {"source": "akshare", "fetcher_name": "macro_china_gdp_yearly"},
-        "china_pmi_manufacturing": {"source": "akshare", "fetcher_name": "macro_china_pmi_yearly"},
-        "china_pmi_non_manufacturing": {"source": "akshare", "fetcher_name": "macro_china_non_man_pmi"},
-        "china_urban_unemployment": {"source": "akshare", "fetcher_name": "macro_china_urban_unemployment"},
-        "china_m2_yoy": {"source": "akshare", "fetcher_name": "macro_china_m2_yearly"},
-        "china_exports_yoy": {"source": "akshare", "fetcher_name": "macro_china_exports_yoy"},
-        "china_imports_yoy": {"source": "akshare", "fetcher_name": "macro_china_imports_yoy"},
-        "china_trade_balance": {"source": "akshare", "fetcher_name": "macro_china_trade_balance"},
-        "china_fx_reserves": {"source": "akshare", "fetcher_name": "macro_china_fx_reserves_yearly"},
-    }
-
-    for key, spec in fetch_specs.items():
-        source = str(spec.get("source", "akshare"))
-        fetcher_name = str(spec.get("fetcher_name", ""))
-        fetcher = getattr(ak, fetcher_name, None)
-        if fetcher is None:
-            results["series"][key] = {
-                "series": key,
-                "source": source,
-                "observations": [],
-                "latest": None,
-                "previous": None,
-                "trend": "flat",
-                "error": f"akshare fetcher unavailable: {fetcher_name}",
-            }
+        {"key": "china_shibor_3m", "fetcher_name": "macro_china_shibor_all", "source": "akshare:china_official:cfets"},
+        {"key": "china_cpi_yoy", "fetcher_name": "macro_china_cpi_yearly", "source": "akshare:china_official:nbs"},
+        {
+            "key": "china_cpi_mom",
+            "fetcher_name": "macro_china_cpi_monthly",
+            "source": "akshare:china_official:nbs",
+            "date_col": "日期",
+            "value_col": "今值",
+        },
+        {"key": "china_ppi_yoy", "fetcher_name": "macro_china_ppi_yearly", "source": "akshare:china_official:nbs"},
+        {"key": "china_gdp_yoy", "fetcher_name": "macro_china_gdp_yearly", "source": "akshare:china_official:nbs"},
+        {"key": "china_pmi_manufacturing", "fetcher_name": "macro_china_pmi_yearly", "source": "akshare:china_official:nbs"},
+        {
+            "key": "china_caixin_pmi_manufacturing",
+            "fetcher_name": "macro_china_cx_pmi_yearly",
+            "source": "akshare:china_official:caixin",
+            "date_col": "日期",
+            "value_col": "今值",
+        },
+        {
+            "key": "china_caixin_pmi_services",
+            "fetcher_name": "macro_china_cx_services_pmi_yearly",
+            "source": "akshare:china_official:caixin",
+            "date_col": "日期",
+            "value_col": "今值",
+        },
+        {"key": "china_pmi_non_manufacturing", "fetcher_name": "macro_china_non_man_pmi", "source": "akshare:china_official:nbs"},
+        {
+            "key": "china_urban_unemployment",
+            "fetcher_name": "macro_china_urban_unemployment",
+            "source": "akshare:china_official:nbs",
+            "date_col": "date",
+            "value_col": "value",
+        },
+        {"key": "china_m2_yoy", "fetcher_name": "macro_china_m2_yearly", "source": "akshare:china_official:pboc"},
+        {
+            "key": "china_social_financing",
+            "fetcher_name": "macro_china_shrzgm",
+            "source": "akshare:china_official:pboc",
+            "date_col": "月份",
+            "value_col": "社会融资规模增量",
+        },
+        {
+            "key": "china_bank_financing",
+            "fetcher_name": "macro_china_bank_financing",
+            "source": "akshare:china_official:pboc",
+            "date_col": "日期",
+            "value_col": "最新值",
+        },
+        {"key": "china_central_bank_balance_sheet", "fetcher_name": "macro_china_central_bank_balance", "source": "akshare:china_official:pboc"},
+        {"key": "china_bank_loan_growth", "fetcher_name": "macro_rmb_loan", "source": "akshare:china_official:pboc"},
+        {"key": "china_real_estate_financing", "fetcher_name": "macro_china_real_estate", "source": "akshare:china_official:nbs"},
+        {
+            "key": "china_fixed_asset_investment_yoy",
+            "fetcher_name": "macro_china_gdzctz",
+            "source": "akshare:china_official:nbs",
+            "date_col": "月份",
+            "value_col": "同比增长",
+        },
+        {
+            "key": "china_retail_sales_yoy",
+            "fetcher_name": "macro_china_consumer_goods_retail",
+            "source": "akshare:china_official:nbs",
+            "date_col": "月份",
+            "value_col": "同比增长",
+        },
+        {"key": "china_industrial_production_yoy", "fetcher_name": "macro_china_industrial_production_yoy", "source": "akshare:china_official:nbs"},
+        {"key": "china_exports_yoy", "fetcher_name": "macro_china_exports_yoy", "source": "akshare:china_official:customs"},
+        {"key": "china_imports_yoy", "fetcher_name": "macro_china_imports_yoy", "source": "akshare:china_official:customs"},
+        {"key": "china_trade_balance", "fetcher_name": "macro_china_trade_balance", "source": "akshare:china_official:customs"},
+        {"key": "china_fx_reserves", "fetcher_name": "macro_china_fx_reserves_yearly", "source": "akshare:china_official:safe"},
+    ]
+    for spec in china_specs:
+        if not _want(str(spec["key"])):
             continue
+        results["series"][spec["key"]] = _akshare_fetch_series(
+            series_name=str(spec["key"]),
+            fetcher_name=str(spec["fetcher_name"]),
+            source=str(spec["source"]),
+            start_date=start_date,
+            end_date=end_date,
+            date_col=spec.get("date_col"),
+            value_col=spec.get("value_col"),
+        )
 
-        try:
-            df = fetcher()
-            if key == "china_shibor_3m":
-                date_col = next(
-                    (
-                        col
-                        for col in df.columns
-                        if str(col).upper() in {"DATE", "日期", "TRADE_DATE"}
-                    ),
-                    None,
-                )
-                value_col = next(
-                    (
-                        col
-                        for col in df.columns
-                        if "3M" in str(col).upper()
-                    ),
-                    None,
-                )
-                series_payload = _normalize_macro_series(
-                    df,
-                    series_name=key,
-                    source=source,
-                    start_date=start_date,
-                    end_date=end_date,
-                    date_col=date_col,
-                    value_col=value_col,
-                )
-            else:
-                series_payload = _normalize_macro_series(
-                    df,
-                    series_name=key,
-                    source=source,
-                    start_date=start_date,
-                    end_date=end_date,
-                    date_col=spec.get("date_col"),
-                    value_col=spec.get("value_col"),
-                )
-        except Exception as exc:
-            logger.warning("Macro fetch failed for %s via %s: %s", key, fetcher_name, exc)
-            series_payload = {
-                "series": key,
-                "source": source,
-                "observations": [],
-                "latest": None,
-                "previous": None,
-                "trend": "flat",
-                "error": str(exc),
-            }
-        results["series"][key] = series_payload
+    # PBOC policy rate fallback: if benchmark-rate series is stale, use LPR 1Y as operational policy proxy.
+    if _want("pboc_policy_rate") and _want("china_lpr_1y"):
+        pb = results["series"].get("pboc_policy_rate")
+        lpr = results["series"].get("china_lpr_1y")
+        pb_dt = _payload_latest_date(pb)
+        lpr_dt = _payload_latest_date(lpr)
+        if lpr_dt and (pb_dt is None or lpr_dt > pb_dt):
+            results["series"]["pboc_policy_rate"] = _clone_series_payload(
+                lpr if isinstance(lpr, dict) else _macro_error_payload("china_lpr_1y", "akshare:china_official:pboc", "lpr unavailable"),
+                series_name="pboc_policy_rate",
+                source="alias:akshare:china_official:pboc:lpr1y",
+            )
 
-    results["series"]["sofr"] = _fetch_sofr_series(start_date=start_date, end_date=end_date)
     results["snapshot_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    results["source_policy"] = {
+        "version": MACRO_SOURCE_POLICY_VERSION,
+        "china": ["akshare:china_official"],
+        "international": ["fred", "imf_datamapper", "world_bank", "akshare:us_macro_ism"],
+        "manual_overrides": ["local:us_pmi_json"],
+    }
     results["latest"] = {
         key: val.get("latest", {}).get("value") if isinstance(val, dict) and val.get("latest") else None
         for key, val in results["series"].items()
     }
     return results
+
+
+MACRO_DIMENSION_MAP: dict[str, str] = {
+    # Growth
+    "us_real_gdp_latest_quarter": "growth",
+    "us_real_gdp_qoq_annualized": "growth",
+    "us_real_gdp_yoy": "growth",
+    "us_gdp_growth": "growth",
+    "us_industrial_production": "growth",
+    "us_retail_sales": "growth",
+    "us_consumer_confidence_cb": "growth",
+    "us_consumer_sentiment_michigan": "growth",
+    "us_non_farm_payrolls": "growth",
+    "china_gdp_yoy": "growth",
+    "china_pmi_manufacturing": "growth",
+    "china_caixin_pmi_manufacturing": "growth",
+    "china_caixin_pmi_services": "growth",
+    "china_pmi_non_manufacturing": "growth",
+    "china_industrial_production_yoy": "growth",
+    "china_retail_sales_yoy": "growth",
+    "china_fixed_asset_investment_yoy": "growth",
+    "china_exports_yoy": "growth",
+    "china_imports_yoy": "growth",
+    "sg_gdp_growth": "growth",
+    "sg_gdp_yoy": "growth",
+    "sg_industrial_production_yoy": "growth",
+    "sg_exports_growth": "growth",
+    "sg_imports_growth": "growth",
+    # Inflation
+    "us_cpi_yoy": "inflation",
+    "us_core_cpi_yoy": "inflation",
+    "us_core_pce_price": "inflation",
+    "us_breakeven_10y": "inflation",
+    "china_cpi_yoy": "inflation",
+    "china_cpi_mom": "inflation",
+    "china_ppi_yoy": "inflation",
+    "sg_inflation_cpi": "inflation",
+    "sg_cpi_yoy": "inflation",
+    "world_inflation": "inflation",
+    # Liquidity
+    "fed_policy_rate": "liquidity",
+    "pboc_policy_rate": "liquidity",
+    "sofr": "liquidity",
+    "us_m2": "liquidity",
+    "china_m2_yoy": "liquidity",
+    "sg_broad_money_growth": "liquidity",
+    "us_central_bank_total_assets": "liquidity",
+    "china_central_bank_balance_sheet": "liquidity",
+    "us_real_rate_10y": "liquidity",
+    "us_real_interest_rate": "liquidity",
+    "sg_real_interest_rate": "liquidity",
+    "us_treasury_2y": "liquidity",
+    "us_treasury_10y": "liquidity",
+    "us_term_spread_10y_2y": "liquidity",
+    "us_term_spread_10y2y": "liquidity",
+    "china_shibor_3m": "liquidity",
+    "china_lpr_1y": "liquidity",
+    "sg_policy_rate": "liquidity",
+    "sg_government_bond_10y": "liquidity",
+    "jp_short_rate_3m": "liquidity",
+    "jp_government_bond_10y": "liquidity",
+    "jp_policy_rate": "liquidity",
+    "eu_short_rate_3m": "liquidity",
+    "eu_government_bond_10y": "liquidity",
+    # Credit
+    "us_corporate_bbb_oas": "credit",
+    "us_business_loan_delinquency_rate": "credit",
+    "us_bank_loan_growth_yoy": "credit",
+    "china_social_financing": "credit",
+    "china_bank_financing": "credit",
+    "china_bank_loan_growth": "credit",
+    "china_real_estate_financing": "credit",
+    # Market
+    "us_equity_sp500": "market_feedback",
+    "us_vix": "market_feedback",
+    "us_dollar_index_broad": "market_feedback",
+    "commodity_wti_crude": "market_feedback",
+    "commodity_copper": "market_feedback",
+    "sg_usd_fx": "market_feedback",
+    "jp_usd_fx": "market_feedback",
+    "eu_usd_fx": "market_feedback",
+    "eu_pmi_manufacturing": "growth",
+}
+
+
+def _macro_country_from_key(key: str) -> str:
+    if key.startswith("us_") or key in {"fed_policy_rate", "sofr"}:
+        return "US"
+    if key.startswith("china_") or key == "pboc_policy_rate":
+        return "CN"
+    if key.startswith("sg_"):
+        return "SG"
+    if key.startswith("jp_"):
+        return "JP"
+    if key.startswith("eu_"):
+        return "EU"
+    if key.startswith("world_") or key.startswith("commodity_"):
+        return "GLOBAL"
+    return "GLOBAL"
+
+
+def _macro_frequency(dates: list[datetime]) -> str:
+    if len(dates) < 2:
+        return "unknown"
+    diffs = sorted(
+        (
+            (dates[i] - dates[i - 1]).days
+            for i in range(1, len(dates))
+            if (dates[i] - dates[i - 1]).days > 0
+        )
+    )
+    if not diffs:
+        return "unknown"
+    median = diffs[len(diffs) // 2]
+    if median <= 10:
+        return "daily"
+    if median <= 45:
+        return "monthly"
+    if median <= 120:
+        return "quarterly"
+    return "annual"
+
+
+def _macro_steps_for_frequency(freq: str) -> dict[str, int]:
+    if freq == "daily":
+        return {"mom": 21, "qoq": 63, "yoy": 252}
+    if freq == "monthly":
+        return {"mom": 1, "qoq": 3, "yoy": 12}
+    if freq == "quarterly":
+        return {"mom": 1, "qoq": 1, "yoy": 4}
+    if freq == "annual":
+        return {"mom": 1, "qoq": 1, "yoy": 1}
+    return {}
+
+
+def _macro_change(values: list[float], steps: int) -> dict[str, float] | None:
+    if steps <= 0 or len(values) <= steps:
+        return None
+    curr = values[-1]
+    prev = values[-1 - steps]
+    delta = curr - prev
+    pct = None
+    if prev != 0:
+        pct = delta / abs(prev)
+    out: dict[str, float] = {"current": curr, "previous": prev, "delta": delta}
+    if pct is not None:
+        out["delta_pct"] = pct
+    return out
+
+
+def _macro_trend(values: list[float], lookback: int = 3) -> str:
+    if len(values) < lookback + 1:
+        return "insufficient"
+    start = values[-(lookback + 1)]
+    end = values[-1]
+    base = max(abs(start), 1e-9)
+    rel = (end - start) / base
+    if rel > 0.01:
+        return "up"
+    if rel < -0.01:
+        return "down"
+    return "flat"
+
+
+def structure_macro_indicators(macro_payload: dict[str, Any]) -> dict[str, Any]:
+    """Transform raw macro payload into LLM/analysis friendly structured format."""
+    series = macro_payload.get("series", {}) if isinstance(macro_payload, dict) else {}
+    cards: dict[str, dict[str, Any]] = {}
+    chart_long: list[dict[str, Any]] = []
+    dimension_buckets: dict[str, list[str]] = {
+        "growth": [],
+        "inflation": [],
+        "liquidity": [],
+        "credit": [],
+        "market_feedback": [],
+        "other": [],
+    }
+
+    for key, payload in series.items():
+        if not isinstance(payload, dict):
+            continue
+        observations = payload.get("observations", [])
+        parsed: list[tuple[datetime, float]] = []
+        if isinstance(observations, list):
+            for row in observations:
+                if not isinstance(row, dict):
+                    continue
+                d = row.get("date")
+                v = row.get("value")
+                if not isinstance(d, str) or not isinstance(v, int | float):
+                    continue
+                try:
+                    parsed.append((datetime.strptime(d[:10], "%Y-%m-%d"), float(v)))
+                except ValueError:
+                    continue
+        parsed.sort(key=lambda x: x[0])
+        dates = [d for d, _ in parsed]
+        values = [v for _, v in parsed]
+        freq = _macro_frequency(dates)
+        steps = _macro_steps_for_frequency(freq)
+        latest_value = values[-1] if values else None
+        latest_date = dates[-1].strftime("%Y-%m-%d") if dates else None
+        mom = _macro_change(values, steps.get("mom", 0)) if steps else None
+        qoq = _macro_change(values, steps.get("qoq", 0)) if steps else None
+        yoy = _macro_change(values, steps.get("yoy", 0)) if steps else None
+        trend_short = _macro_trend(values, lookback=3)
+        trend_medium = _macro_trend(values, lookback=6)
+        volatility = None
+        if len(values) >= 6:
+            volatility = float(pd.Series(values[-24:]).pct_change().dropna().std())
+
+        dimension = MACRO_DIMENSION_MAP.get(key, "other")
+        country = _macro_country_from_key(key)
+        card = {
+            "key": key,
+            "dimension": dimension,
+            "country": country,
+            "source": payload.get("source"),
+            "frequency": freq,
+            "latest_value": latest_value,
+            "latest_date": latest_date,
+            "trend_short": trend_short,
+            "trend_medium": trend_medium,
+            "mom": mom,
+            "qoq": qoq,
+            "yoy": yoy,
+            "volatility": volatility,
+            "obs_count": len(values),
+            "error": payload.get("error"),
+        }
+        cards[key] = card
+        dimension_buckets.setdefault(dimension, []).append(key)
+
+        for d, v in parsed:
+            chart_long.append(
+                {
+                    "key": key,
+                    "date": d.strftime("%Y-%m-%d"),
+                    "value": v,
+                    "dimension": dimension,
+                    "country": country,
+                    "source": payload.get("source"),
+                }
+            )
+
+    coverage = {
+        "total_metrics": len(cards),
+        "ok_metrics": sum(1 for c in cards.values() if c.get("error") is None and c.get("obs_count", 0) > 0),
+        "error_metrics": sum(1 for c in cards.values() if c.get("error")),
+        "empty_metrics": sum(1 for c in cards.values() if c.get("obs_count", 0) == 0),
+    }
+
+    return {
+        "meta": {
+            "snapshot_at": macro_payload.get("snapshot_at") if isinstance(macro_payload, dict) else None,
+            "source_policy": macro_payload.get("source_policy") if isinstance(macro_payload, dict) else None,
+            "coverage": coverage,
+        },
+        "dimensions": {
+            dim: [cards[k] for k in keys]
+            for dim, keys in dimension_buckets.items()
+        },
+        "metrics": cards,
+        "chart_data": {
+            "long": chart_long,
+        },
+    }
+
+
+def get_macro_indicators_structured(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    raw = get_macro_indicators(start_date=start_date, end_date=end_date)
+    return structure_macro_indicators(raw)
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
@@ -1893,6 +3375,3 @@ if __name__ == "__main__":
         print(f"Moutai Line Items (latest 2): {moutai_items}")
     except Exception as e:
         print(f"Error getting Moutai line items: {e}")
-
-
-

@@ -5,6 +5,7 @@ from .providers import (
     AkshareProvider,
     DataProvider,
     FinnhubProvider,
+    SECEDGARProvider,
     YFinanceProvider,
     create_data_provider,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "DataProvider",
     "AkshareProvider",
     "FinnhubProvider",
+    "SECEDGARProvider",
     "YFinanceProvider",
     "create_data_provider",
     "DataCache",

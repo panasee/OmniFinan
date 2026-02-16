@@ -121,6 +121,8 @@ class FinancialMetrics(BaseModel):
     cash_ratio: float | None = None
     operating_cash_flow_ratio: float | None = None
     debt_to_equity: float | None = None
+    liabilities_to_equity: float | None = None
+    interest_bearing_debt: float | None = None
     debt_to_assets: float | None = None
     interest_coverage: float | None = None
     revenue_growth: float | None = None

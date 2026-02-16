@@ -87,3 +87,12 @@ class AkshareProvider(DataProvider):
     ) -> dict:
         self._throttle()
         return get_macro_indicators(start_date=start_date, end_date=end_date)
+
+    def get_macro_indicators_subset(
+        self,
+        series_keys: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        self._throttle()
+        return get_macro_indicators(start_date=start_date, end_date=end_date, include_series=series_keys)

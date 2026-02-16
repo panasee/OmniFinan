@@ -30,10 +30,16 @@ def load_provider_credentials() -> dict[str, Any]:
 
 def get_api_key(provider: str) -> str | None:
     payload = load_provider_credentials()
-    node = payload.get(provider, {})
-    if isinstance(node, dict):
-        val = node.get("api_key")
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+    node: Any = payload.get(provider)
+    if not isinstance(node, dict):
+        target = provider.strip().lower()
+        for key, value in payload.items():
+            if isinstance(key, str) and key.strip().lower() == target and isinstance(value, dict):
+                node = value
+                break
+    if not isinstance(node, dict):
+        return None
+    val = node.get("api_key")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
     return None
-

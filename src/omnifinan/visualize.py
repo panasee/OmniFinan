@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import talib as ta
 from langchain_core.runnables.graph import MermaidDrawMethod
+from plotly.subplots import make_subplots
 from pyomnix.data_process import DataManipulator
 from pyomnix.omnix_logger import get_logger
 from pyomnix.utils import ObjectArray
@@ -56,6 +57,109 @@ DEFAULT_SCATTER_SPEC = {
 }
 
 VOLUME_DEF = "volume"  # default to成交量
+
+
+def macro_structured_to_dataframe(
+    structured: dict[str, Any],
+    *,
+    dimension: str | None = None,
+    country: str | None = None,
+) -> pd.DataFrame:
+    """Convert structured macro payload to plotting-friendly long DataFrame."""
+    long_rows = structured.get("chart_data", {}).get("long", []) if isinstance(structured, dict) else []
+    if not isinstance(long_rows, list):
+        return pd.DataFrame(columns=["key", "date", "value", "dimension", "country", "source"])
+    df = pd.DataFrame(long_rows)
+    if df.empty:
+        return pd.DataFrame(columns=["key", "date", "value", "dimension", "country", "source"])
+    if dimension:
+        df = df[df["dimension"] == dimension]
+    if country:
+        df = df[df["country"] == country]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["date", "value"]).sort_values(["dimension", "key", "date"])
+    return df
+
+
+def create_macro_figure(
+    structured: dict[str, Any],
+    *,
+    dimensions: list[str] | None = None,
+    max_series_per_dimension: int = 6,
+    height: int = 1100,
+    width: int = 1300,
+) -> go.Figure:
+    """Create multi-panel macro chart from structured macro payload."""
+    dims = dimensions or ["growth", "inflation", "liquidity", "credit", "market_feedback"]
+    cards = structured.get("metrics", {}) if isinstance(structured, dict) else {}
+    if not isinstance(cards, dict):
+        cards = {}
+    df = macro_structured_to_dataframe(structured)
+
+    fig = make_subplots(
+        rows=max(1, len(dims)),
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.04,
+        subplot_titles=[d.title() for d in dims],
+    )
+    if df.empty:
+        fig.update_layout(
+            title="Macro Dashboard (no data)",
+            template="plotly_white",
+            width=width,
+            height=height,
+        )
+        return fig
+
+    row = 1
+    for dim in dims:
+        dim_df = df[df["dimension"] == dim]
+        if dim_df.empty:
+            row += 1
+            continue
+        metric_keys = [
+            k
+            for k, card in cards.items()
+            if isinstance(card, dict) and card.get("dimension") == dim and card.get("error") is None
+        ]
+        if not metric_keys:
+            metric_keys = list(dim_df["key"].drop_duplicates())
+
+        metric_keys = sorted(
+            metric_keys,
+            key=lambda k: int(dim_df[dim_df["key"] == k].shape[0]),
+            reverse=True,
+        )[: max(1, max_series_per_dimension)]
+
+        for key in metric_keys:
+            sub = dim_df[dim_df["key"] == key]
+            if sub.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["date"],
+                    y=sub["value"],
+                    mode="lines",
+                    name=key,
+                    line={"width": 2},
+                ),
+                row=row,
+                col=1,
+            )
+        row += 1
+
+    snap = structured.get("meta", {}).get("snapshot_at") if isinstance(structured, dict) else None
+    fig.update_layout(
+        template="plotly_white",
+        width=width,
+        height=height,
+        title=f"Macro Dashboard ({snap})" if snap else "Macro Dashboard",
+        legend={"orientation": "h", "y": -0.06},
+        margin={"l": 40, "r": 20, "t": 60, "b": 70},
+    )
+    return fig
 
 
 def save_graph_as_png(app, output_file_path: Path) -> None:
