@@ -3,6 +3,7 @@ __pycache__/
 reference/
 *.py[codz]
 *$py.class
+*workspace
 
 # C extensions
 *.so
@@ -208,3 +209,10 @@ marimo/_lsp/
 __marimo__/
 # ignore test ipynb files
 tests/*.ipynb
+
+# OmniFinan runtime hot data (must live under OMNIX_PATH/omnifinan, not repo)
+log/
+logs/
+outputs/
+request_cache/
+datasets/

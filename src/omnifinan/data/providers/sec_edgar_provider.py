@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -55,6 +56,70 @@ class SECEDGARProvider(DataProvider):
         self._ticker_map_cache: dict[str, str] | None = None
         self._facts_cache: dict[str, dict[str, Any]] = {}
         self._submissions_cache: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _market_for_ticker(ticker: str) -> MarketType:
+        symbol = ticker.strip().upper()
+        if re.fullmatch(r"\d{5}", symbol):
+            return MarketType.HK
+        if re.fullmatch(r"\d{6}", symbol):
+            return MarketType.CHINA
+        if symbol.endswith((".SH", ".SZ", ".BJ")):
+            return MarketType.CHINA
+        if re.fullmatch(r"[A-Z]{1,5}([._-][A-Z0-9]{1,5})?", symbol):
+            return MarketType.US
+        return MarketType.UNKNOWN
+
+    @staticmethod
+    def _merge_financial_metrics_prefer_primary(
+        primary: list[FinancialMetrics],
+        secondary: list[FinancialMetrics],
+        limit: int,
+    ) -> list[FinancialMetrics]:
+        if not primary:
+            return secondary[: max(1, limit)]
+        if not secondary:
+            return primary[: max(1, limit)]
+        p0 = primary[0]
+        s0 = secondary[0]
+        p_data = p0.model_dump() if hasattr(p0, "model_dump") else dict(p0)
+        s_data = s0.model_dump() if hasattr(s0, "model_dump") else dict(s0)
+        merged = dict(p_data)
+        for k, v in s_data.items():
+            if merged.get(k) is None and v is not None:
+                merged[k] = v
+        return [FinancialMetrics(**merged)][: max(1, limit)]
+
+    @staticmethod
+    def _merge_line_items_prefer_primary(
+        primary: list[LineItem],
+        secondary: list[LineItem],
+        limit: int,
+    ) -> list[LineItem]:
+        if not primary:
+            return secondary[: max(1, limit)]
+        if not secondary:
+            return primary[: max(1, limit)]
+        merged_by_period: dict[str, dict[str, Any]] = {}
+        for row in secondary:
+            payload = row.model_dump() if hasattr(row, "model_dump") else dict(row)
+            period = str(payload.get("report_period", ""))
+            if period:
+                merged_by_period[period] = payload
+        for row in primary:
+            payload = row.model_dump() if hasattr(row, "model_dump") else dict(row)
+            period = str(payload.get("report_period", ""))
+            if not period:
+                continue
+            base = merged_by_period.get(period, {})
+            merged = dict(base)
+            merged.update(payload)
+            for k, v in base.items():
+                if merged.get(k) is None and v is not None:
+                    merged[k] = v
+            merged_by_period[period] = merged
+        out = [LineItem(**merged_by_period[k]) for k in sorted(merged_by_period.keys(), reverse=True)]
+        return out[: max(1, limit)]
 
     @staticmethod
     def _user_agent() -> str:
@@ -464,6 +529,15 @@ class SECEDGARProvider(DataProvider):
     def get_financial_metrics(
         self, ticker: str, end_date: str | None = None, period: str = "ttm", limit: int = 1
     ) -> list[FinancialMetrics]:
+        market = self._market_for_ticker(ticker)
+        if market != MarketType.US:
+            return self._fallback_macro.get_financial_metrics(
+                ticker=ticker,
+                end_date=end_date,
+                period=period,
+                limit=limit,
+            )
+
         facts = self._company_facts(ticker)
         symbol = ticker.strip().upper()
 
@@ -694,7 +768,7 @@ class SECEDGARProvider(DataProvider):
         ev_to_rev = self._safe_div(enterprise_value, revenue)
         fcf_yield = self._safe_div(fcf, market_cap)
 
-        return [
+        sec_metrics = [
             FinancialMetrics(
                 ticker=symbol,
                 report_period=report_period,
@@ -734,7 +808,22 @@ class SECEDGARProvider(DataProvider):
             )
         ][: max(1, limit)]
 
+        try:
+            ak_metrics = self._fallback_macro.get_financial_metrics(
+                ticker=ticker,
+                end_date=end_date,
+                period=period,
+                limit=limit,
+            )
+        except Exception:
+            ak_metrics = []
+        return self._merge_financial_metrics_prefer_primary(sec_metrics, ak_metrics, limit)
+
     def search_line_items(self, ticker: str, period: str = "ttm", limit: int = 10) -> list[LineItem]:
+        market = self._market_for_ticker(ticker)
+        if market != MarketType.US:
+            return self._fallback_macro.search_line_items(ticker=ticker, period=period, limit=limit)
+
         facts = self._company_facts(ticker)
         symbol = ticker.strip().upper()
 
@@ -856,7 +945,12 @@ class SECEDGARProvider(DataProvider):
                     cash_ratio=self._safe_div(cash, cl),
                 )
             )
-        return out[:limit]
+        sec_items = out[:limit]
+        try:
+            ak_items = self._fallback_macro.search_line_items(ticker=ticker, period=period, limit=limit)
+        except Exception:
+            ak_items = []
+        return self._merge_line_items_prefer_primary(sec_items, ak_items, limit)
 
     def get_company_news(
         self,
@@ -955,6 +1049,10 @@ class SECEDGARProvider(DataProvider):
         return out[:limit]
 
     def get_market_cap(self, ticker: str, end_date: str | None = None) -> float | None:
+        market = self._market_for_ticker(ticker)
+        if market != MarketType.US:
+            return self._fallback_macro.get_market_cap(ticker=ticker, end_date=end_date)
+
         shares: float | None = None
         try:
             facts = self._company_facts(ticker)

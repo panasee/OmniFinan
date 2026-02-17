@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Any
@@ -59,6 +60,54 @@ class UnifiedDataService:
 
     def _date_to_str(self, d: date) -> str:
         return d.strftime("%Y-%m-%d")
+
+    def _parse_datetime(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    return parsed.replace(tzinfo=None)
+                return parsed
+            except Exception:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y%m%d"):
+                try:
+                    return datetime.strptime(text[:19], fmt)
+                except ValueError:
+                    continue
+        return None
+
+    def _interval_to_timedelta(self, interval: str) -> timedelta:
+        text = str(interval or "1d").strip().lower()
+        m = re.fullmatch(r"(\d+)\s*(m|h|d|w|wk|mo|q|y)", text)
+        if not m:
+            return timedelta(days=1)
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "m":
+            return timedelta(minutes=n)
+        if unit == "h":
+            return timedelta(hours=n)
+        if unit == "d":
+            return timedelta(days=n)
+        if unit in {"w", "wk"}:
+            return timedelta(days=7 * n)
+        if unit == "mo":
+            return timedelta(days=30 * n)
+        if unit == "q":
+            return timedelta(days=90 * n)
+        if unit == "y":
+            return timedelta(days=365 * n)
+        return timedelta(days=1)
 
     def _merge_records(self, existing: list[dict[str, Any]], incoming: list[dict[str, Any]], key_field: str):
         merged: dict[str, dict[str, Any]] = {}
@@ -463,6 +512,7 @@ class UnifiedDataService:
         start_date: str | None,
         end_date: str | None,
         interval: str = "1d",
+        force: bool = False,
     ):
         dataset_key = f"{self._ticker_key(ticker)}__{interval}"
         stored = self.cache.get_dataset("prices", dataset_key) or []
@@ -471,14 +521,22 @@ class UnifiedDataService:
 
         target_start = self._parse_date(start_date)
         target_end = self._parse_date(end_date or self._today_str())
+        now_dt = datetime.now()
+        refresh_window = self._interval_to_timedelta(interval) * 2
 
         fetch_chunks: list[list[dict[str, Any]]] = []
-        if not stored:
+        if force or not stored:
             initial = price_provider.get_prices(ticker, start_date, end_date, interval=interval)
             fetch_chunks.append(self._model_dump_list(initial))
         else:
             first_date = self._parse_date(stored[0].get("time"))
             last_date = self._parse_date(stored[-1].get("time"))
+            last_dt = self._parse_datetime(stored[-1].get("time"))
+            should_refresh_latest = (
+                force
+                or last_dt is None
+                or (now_dt - last_dt) > refresh_window
+            )
 
             if target_start and first_date and target_start < first_date:
                 backfill_end = first_date - timedelta(days=1)
@@ -491,7 +549,7 @@ class UnifiedDataService:
                     )
                     fetch_chunks.append(self._model_dump_list(backfill))
 
-            if target_end and last_date and target_end > last_date:
+            if should_refresh_latest and target_end and last_date and target_end > last_date:
                 append_start = last_date + timedelta(days=1)
                 if append_start <= target_end:
                     append_rows = price_provider.get_prices(
@@ -510,13 +568,25 @@ class UnifiedDataService:
             self.cache.set_dataset("prices", dataset_key, stored)
         return self._filter_by_date_range(stored, "time", start_date, end_date)
 
-    def get_financial_metrics(self, ticker: str, end_date: str | None, period: str = "ttm", limit: int = 1):
+    def get_financial_metrics(
+        self,
+        ticker: str,
+        end_date: str | None,
+        period: str = "ttm",
+        limit: int = 1,
+        force: bool = False,
+    ):
         dataset_key = f"{self._ticker_key(ticker)}__{period}"
         stored = self.cache.get_dataset("financial_metrics", dataset_key) or []
         stored = self._sort_by_date(stored, "report_period", descending=True)
 
         eligible = self._filter_by_date_range(stored, "report_period", None, end_date)
-        if len(eligible) < limit:
+        latest_report_date = self._parse_date(stored[0].get("report_period")) if stored else None
+        stale_financial = (
+            latest_report_date is None
+            or (date.today() - latest_report_date).days > 30
+        )
+        if force or stale_financial or len(eligible) < limit:
             fetch_limit = max(limit, len(stored) + max(limit, 5))
             fetched = self._model_dump_list(
                 self.provider.get_financial_metrics(
@@ -534,11 +604,16 @@ class UnifiedDataService:
 
         return eligible[:limit]
 
-    def get_line_items(self, ticker: str, period: str = "ttm", limit: int = 10):
+    def get_line_items(self, ticker: str, period: str = "ttm", limit: int = 10, force: bool = False):
         dataset_key = f"{self._ticker_key(ticker)}__{period}"
         stored = self.cache.get_dataset("line_items", dataset_key) or []
         stored = self._sort_by_date(stored, "report_period", descending=True)
-        if len(stored) < limit:
+        latest_report_date = self._parse_date(stored[0].get("report_period")) if stored else None
+        stale_line_items = (
+            latest_report_date is None
+            or (date.today() - latest_report_date).days > 30
+        )
+        if force or stale_line_items or len(stored) < limit:
             fetch_limit = max(limit, len(stored) + max(limit, 5))
             fetched = self._model_dump_list(
                 self.provider.search_line_items(
@@ -561,7 +636,12 @@ class UnifiedDataService:
             lambda: self.provider.get_market_cap(ticker=ticker, end_date=end_date),
         )
 
-    def get_macro_indicators(self, start_date: str | None = None, end_date: str | None = None):
+    def get_macro_indicators(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        force: bool = False,
+    ):
         source_policy_version = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"
         dataset_key = f"{source_policy_version}__master"
         params = {
@@ -570,11 +650,10 @@ class UnifiedDataService:
         }
         cached = self.cache.get("macro_indicators", params, ttl_seconds=self.ttl_seconds)
         payload = cached if isinstance(cached, dict) else None
-        cached_updated_at = self.cache.get_request_updated_at("macro_indicators", params)
         today = date.today()
 
         # Request-cache miss fallback: restore latest master snapshot from dataset history.
-        if payload is None and cached_updated_at is None:
+        if payload is None:
             history = self.cache.get_dataset("macro_indicators_history", dataset_key) or []
             if isinstance(history, list):
                 candidates = [item for item in history if isinstance(item, dict)]
@@ -582,16 +661,18 @@ class UnifiedDataService:
                     candidates = sorted(candidates, key=lambda x: str(x.get("snapshot_at", "")))
                     payload = candidates[-1]
                     self.cache.set("macro_indicators", params, payload)
-                    cached_updated_at = self.cache.get_request_updated_at("macro_indicators", params)
                     logger.info(
                         "Macro request cache restored from dataset master snapshot. snapshot_at=%s",
                         str(payload.get("snapshot_at", "")),
                     )
 
+        if force:
+            logger.info("Macro force refresh requested. window=%s~%s", start_date, end_date)
+
         # Series-level refresh policy:
         # - derive staleness from latest observation date + expected update cycle per series
         # - refresh only stale keys when subset endpoint is available
-        if isinstance(payload, dict) and cached_updated_at is not None:
+        if isinstance(payload, dict) and not force:
             has_non_empty = self._is_non_empty_macro_payload(payload)
             stale_keys = self._macro_stale_keys(payload, as_of=today)
             if has_non_empty and not stale_keys:
@@ -601,17 +682,6 @@ class UnifiedDataService:
                     end_date,
                 )
                 return self._filter_macro_payload_window(payload, start_date, end_date)
-            if has_non_empty and stale_keys:
-                # Avoid repeated expensive refresh loops when providers return no data delta.
-                # If this master cache file was just refreshed, serve local data directly.
-                if (datetime.now() - cached_updated_at) < timedelta(days=1):
-                    logger.info(
-                        "Macro stale refresh skipped: master cache refreshed within 24h. stale=%d window=%s~%s",
-                        len(stale_keys),
-                        start_date,
-                        end_date,
-                    )
-                    return self._filter_macro_payload_window(payload, start_date, end_date)
             if stale_keys:
                 if hasattr(self.provider, "get_macro_indicators_subset"):
                     logger.info(
@@ -674,17 +744,22 @@ class UnifiedDataService:
                     self.cache.set_dataset("macro_indicators_history", dataset_key, history)
         return self._filter_macro_payload_window(payload, start_date, end_date)
 
-    def get_macro_indicators_structured(self, start_date: str | None = None, end_date: str | None = None):
+    def get_macro_indicators_structured(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        force: bool = False,
+    ):
         from ..unified_api import structure_macro_indicators
 
-        raw = self.get_macro_indicators(start_date=start_date, end_date=end_date)
+        raw = self.get_macro_indicators(start_date=start_date, end_date=end_date, force=force)
         params = {
             "start_date": start_date,
             "end_date": end_date,
             "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
             "view": "structured_v1",
         }
-        cached = self.cache.get("macro_indicators_structured", params, ttl_seconds=self.ttl_seconds)
+        cached = None if force else self.cache.get("macro_indicators_structured", params, ttl_seconds=self.ttl_seconds)
         if isinstance(cached, dict):
             return cached
         structured = structure_macro_indicators(raw if isinstance(raw, dict) else {})
