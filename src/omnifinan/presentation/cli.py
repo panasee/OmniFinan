@@ -80,7 +80,7 @@ def run_cli() -> None:
     if args.show_agent_graph:
         workflow = create_workflow(selected_analysts)
         app = workflow.compile()
-        file_path = OMNIX_PATH / "financial" / "agent-graph"
+        file_path = OMNIX_PATH / "omnifinan" / "reports" / "agent-graph"
         file_path.mkdir(parents=True, exist_ok=True)
         save_graph_as_png(app, file_path / "graph.png")
     print(

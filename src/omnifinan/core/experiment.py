@@ -17,7 +17,7 @@ class ExperimentRecorder:
 
     @property
     def file_path(self) -> Path:
-        root = self.base_dir or (OMNIX_PATH / "financial" / "experiments")
+        root = self.base_dir or (OMNIX_PATH / "omnifinan" / "reports" / "experiments")
         root.mkdir(parents=True, exist_ok=True)
         return root / f"{self.run_id}.json"
 

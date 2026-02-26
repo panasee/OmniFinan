@@ -106,7 +106,7 @@ def get_news_sentiment(
     if not news_list:
         return 0.0
 
-    cache_file = OMNIX_PATH / "financial" / "sentiment_cache.json"
+    cache_file = OMNIX_PATH / "omnifinan" / "request_cache" / "sentiment_cache.json"
     cache_file.parent.mkdir(parents=True, exist_ok=True)
 
     # 生成新闻内容的唯一标识

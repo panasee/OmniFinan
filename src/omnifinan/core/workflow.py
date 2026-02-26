@@ -110,7 +110,7 @@ def run_hedge_fund(
             }
         )
 
-        out_dir = OMNIX_PATH / "financial"
+        out_dir = OMNIX_PATH / "omnifinan" / "reports"
         out_dir.mkdir(parents=True, exist_ok=True)
         json.dump(final_state, open(out_dir / "hedge_fund_output.json", "w", encoding="utf-8"))
 

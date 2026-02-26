@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 
 
 def _cache_root() -> Path:
-    root = OMNIX_PATH / "financial" / "llm_cache"
+    root = OMNIX_PATH / "omnifinan" / "request_cache" / "llm_cache"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

@@ -185,6 +185,7 @@ class StockFigure:
         subfig_height: float = 0.2,
         width: int = 600,
         height: int = 1600,
+        lookback_years: int | None = 5,
     ):
         self.actual_rows = (1 + no_subfig) * n_rows
         self.sub_rows = 1 + no_subfig  # rows of per group
@@ -193,6 +194,7 @@ class StockFigure:
         self.markets = np.empty((n_rows, n_cols), dtype=object)
         self.plot_datas = self.plotobj.datas  # just an ObjectArray used for real-time plotting
         self.data_dfs = ObjectArray(n_rows, n_cols)  # used for data calculation
+        self.lookback_years = lookback_years
         self.fig = self._create_fig_and_arrange_data(
             n_rows, n_cols, no_subfig, subfig_height, width, height
         )
@@ -259,22 +261,37 @@ class StockFigure:
         return go.Figure(fig)
 
     @staticmethod
-    def process_data_df(data_df: pd.DataFrame, market: str = "US") -> pd.DataFrame:
+    def process_data_df(
+        data_df: pd.DataFrame,
+        market: str = "US",
+        lookback_years: int | None = None,
+    ) -> pd.DataFrame:
         logger.validate(
             str(market).upper() in {"US", "A", "HK", "NA"},
             "market must be one of {'US', 'A', 'HK', 'NA'}",
         )
         if data_df.index.name == "time":
+            out = data_df.copy()
+            if lookback_years is not None and len(out.index) > 0:
+                idx = pd.to_datetime(out.index, errors="coerce")
+                latest = idx.max()
+                if pd.notna(latest):
+                    cutoff = latest - pd.DateOffset(years=lookback_years)
+                    out = out[idx >= cutoff]
             try:
-                data_df = data_df.drop(columns=["time"])
+                out = out.drop(columns=["time"])
             except KeyError:
                 pass
-            return data_df
+            return out
         # filter out weekends and market-specific holidays
-        data_df = filter_trading_days(data_df, str(market).upper())
-        data_df = data_df.set_index(pd.DatetimeIndex(data_df["time"]))
-        data_df = data_df.drop(columns=["time"])
-        return data_df
+        out = filter_trading_days(data_df, str(market).upper())
+        out = out.set_index(pd.DatetimeIndex(out["time"]))
+        if lookback_years is not None and len(out.index) > 0:
+            latest = out.index.max()
+            cutoff = latest - pd.DateOffset(years=lookback_years)
+            out = out[out.index >= cutoff]
+        out = out.drop(columns=["time"])
+        return out
 
     def add_candle_trace(
         self,
@@ -287,6 +304,7 @@ class StockFigure:
         low_arr: Sequence[float] | None = None,
         close_arr: Sequence[float] | None = None,
         market="NA",
+        lookback_years: int | None = None,
         plot_spec: dict[str, Any] | None = None,
     ) -> None:
         if plot_spec is not None:
@@ -316,7 +334,8 @@ class StockFigure:
                 }
             )
 
-        data_df = self.process_data_df(data_df, market)
+        effective_lookback = self.lookback_years if lookback_years is None else lookback_years
+        data_df = self.process_data_df(data_df, market, lookback_years=effective_lookback)
         self.markets[row, col] = str(market).upper()
         # filter out weekends and market-specific holidays
         self.data_dfs[row, col] = data_df

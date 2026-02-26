@@ -88,7 +88,7 @@ class RunTrace:
         )
 
     def persist(self, base_dir: Path | None = None) -> Path:
-        target_dir = base_dir or (OMNIX_PATH / "financial" / "runs")
+        target_dir = base_dir or (OMNIX_PATH / "omnifinan" / "logs" / "runs")
         target_dir.mkdir(parents=True, exist_ok=True)
         target_file = target_dir / f"{self.run_id}.json"
         with open(target_file, "w", encoding="utf-8") as f:

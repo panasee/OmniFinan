@@ -640,34 +640,6 @@ def calculate_macd(prices_df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     signal_line = macd_line.ewm(span=9, adjust=False).mean()
     return macd_line, signal_line
 
-def calculate_ichimoku(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """
-    Calculate Ichimoku Cloud indicators
-    """
-    period9_high = df["high"].rolling(window=9).max()
-    period9_low = df["low"].rolling(window=9).min()
-    tenkan_sen = (period9_high + period9_low) / 2
-
-    period26_high = df["high"].rolling(window=26).max()
-    period26_low = df["low"].rolling(window=26).min()
-    kijun_sen = (period26_high + period26_low) / 2
-
-    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
-
-    period52_high = df["high"].rolling(window=52).max()
-    period52_low = df["low"].rolling(window=52).min()
-    senkou_span_b = ((period52_high + period52_low) / 2).shift(26)
-
-    chikou_span = df["close"].shift(-26)
-
-    return {
-        "tenkan_sen": tenkan_sen,
-        "kijun_sen": kijun_sen,
-        "senkou_span_a": senkou_span_a,
-        "senkou_span_b": senkou_span_b,
-        "chikou_span": chikou_span,
-    }
-
 def calculate_obv(prices_df: pd.DataFrame) -> pd.Series:
     obv = [0]
     for i in range(1, len(prices_df)):

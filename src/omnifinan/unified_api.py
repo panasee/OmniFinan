@@ -17,6 +17,7 @@ APIs, but ensures the output structure remains consistent.
 import json
 import os
 import re
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from io import StringIO
@@ -48,14 +49,10 @@ from .data_models import (
 # Setup logging
 logger = get_logger("unified_api")
 
+AKSHARE_REQUEST_INTERVAL_SECONDS = 0.5
+AKSHARE_MAX_RETRIES = 3
+
 # --- Helper Functions ---
-
-
-def load_from_file(symbol: str) -> Any:
-    """Load data from a JSON file."""
-    file_path = OMNIX_PATH / "financial" / "data" / f"{symbol}.json"
-    with open(file_path, encoding="utf-8") as f:
-        return json.load(f)
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -76,6 +73,30 @@ def normalize_ticker(ticker: str) -> str:
         return ticker.zfill(5)
     # For US stocks or others, return as is after removing suffix
     return ticker
+
+
+def _call_akshare(func, *args, **kwargs):
+    """Call an AkShare function with fixed request interval and retry."""
+    last_exc: Exception | None = None
+    for attempt in range(1, AKSHARE_MAX_RETRIES + 1):
+        # Keep a fixed spacing between requests to reduce remote disconnect/rate-limit pressure.
+        if AKSHARE_REQUEST_INTERVAL_SECONDS > 0:
+            time.sleep(AKSHARE_REQUEST_INTERVAL_SECONDS)
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= AKSHARE_MAX_RETRIES:
+                raise
+            logger.warning(
+                "AkShare call failed (%s), retry %s/%s: %s",
+                getattr(func, "__name__", str(func)),
+                attempt,
+                AKSHARE_MAX_RETRIES,
+                exc,
+            )
+    if last_exc is not None:
+        raise last_exc
 
 
 def detect_market(normalized_ticker: str) -> MarketType:
@@ -2303,14 +2324,16 @@ def get_prices(
 
             if market == MarketType.US:
                 # AkShare US minute endpoint usually provides the most recent few sessions.
-                df = ak.stock_us_hist_min_em(
+                df = _call_akshare(
+                    ak.stock_us_hist_min_em,
                     symbol=_to_us_minute_symbol(normalized_ticker),
                     start_date=minute_start,
                     end_date=minute_end,
                 )
             elif market == MarketType.HK:
                 try:
-                    df = ak.stock_hk_hist_min_em(
+                    df = _call_akshare(
+                        ak.stock_hk_hist_min_em,
                         symbol=normalized_ticker,
                         period=minute_period,
                         start_date=minute_start,
@@ -2318,7 +2341,8 @@ def get_prices(
                         adjust=adjustment,
                     )
                 except TypeError:
-                    df = ak.stock_hk_hist_min_em(
+                    df = _call_akshare(
+                        ak.stock_hk_hist_min_em,
                         symbol=normalized_ticker,
                         period=minute_period,
                         start_date=minute_start,
@@ -2326,7 +2350,8 @@ def get_prices(
                     )
             elif market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]:
                 try:
-                    df = ak.stock_zh_a_hist_min_em(
+                    df = _call_akshare(
+                        ak.stock_zh_a_hist_min_em,
                         symbol=normalized_ticker,
                         period=minute_period,
                         start_date=minute_start,
@@ -2334,7 +2359,8 @@ def get_prices(
                         adjust=adjustment,
                     )
                 except TypeError:
-                    df = ak.stock_zh_a_hist_min_em(
+                    df = _call_akshare(
+                        ak.stock_zh_a_hist_min_em,
                         symbol=normalized_ticker,
                         period=minute_period,
                         start_date=minute_start,
@@ -2359,11 +2385,12 @@ def get_prices(
 
         elif api == "sina":
             if market == MarketType.US:
-                df = ak.stock_us_daily(symbol=normalized_ticker, adjust=adjustment)
+                df = _call_akshare(ak.stock_us_daily, symbol=normalized_ticker, adjust=adjustment)
             elif market == MarketType.HK:
-                df = ak.stock_hk_daily(symbol=normalized_ticker, adjust=adjustment)
+                df = _call_akshare(ak.stock_hk_daily, symbol=normalized_ticker, adjust=adjustment)
             elif market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]:
-                df = ak.stock_zh_a_daily(
+                df = _call_akshare(
+                    ak.stock_zh_a_daily,
                     symbol=f"{market.value}{normalized_ticker}",
                     start_date=start_date_ak,
                     end_date=end_date_ak,
@@ -2373,7 +2400,8 @@ def get_prices(
 
         elif api == "em":
             if market == MarketType.US:
-                df = ak.stock_us_hist(
+                df = _call_akshare(
+                    ak.stock_us_hist,
                     symbol=normalized_ticker,
                     period="daily",
                     start_date=start_date_ak,
@@ -2381,7 +2409,8 @@ def get_prices(
                     adjust=adjustment,
                 )
             elif market == MarketType.HK:
-                df = ak.stock_hk_hist(
+                df = _call_akshare(
+                    ak.stock_hk_hist,
                     symbol=normalized_ticker,
                     period="daily",
                     start_date=start_date_ak,
@@ -2389,7 +2418,8 @@ def get_prices(
                     adjust=adjustment,
                 )
             else:
-                df = ak.stock_zh_a_hist(
+                df = _call_akshare(
+                    ak.stock_zh_a_hist,
                     symbol=normalized_ticker,
                     period="daily",
                     start_date=start_date_ak,
@@ -2562,20 +2592,37 @@ def get_financial_metrics(
             calculated_market_cap = None
 
             if market == MarketType.US:
-                q_df = ak.stock_individual_basic_info_us_xq(symbol=normalized_ticker)
-                if not q_df.empty:
-                    quote_map = _kv_from_item_value_df(q_df)
-                    if len(q_df) > 0:
-                        quote_data = q_df.iloc[0]
-                else:
-                    logger.warning(f"Could not fetch US quote data for {normalized_ticker}")
+                # US quote data should not depend on AkShare Xueqiu endpoint.
                 try:
-                    us_ind_df = ak.stock_financial_us_analysis_indicator_em(
+                    import yfinance as yf  # type: ignore
+
+                    tk = yf.Ticker(normalized_ticker)
+                    fast_info = getattr(tk, "fast_info", {}) or {}
+                    info = getattr(tk, "info", {}) or {}
+                    quote_map = {
+                        "market_cap": fast_info.get("market_cap") or info.get("marketCap"),
+                        "total_shares": fast_info.get("shares") or info.get("sharesOutstanding"),
+                        "pe_ratio": fast_info.get("trailing_pe") or info.get("trailingPE"),
+                        "pettm": fast_info.get("trailing_pe") or info.get("trailingPE"),
+                        "price_to_book_ratio": info.get("priceToBook"),
+                        "price_to_sales_ratio": info.get("priceToSalesTrailing12Months"),
+                    }
+                except Exception as e_quote:
+                    logger.warning(
+                        "US yfinance quote fetch failed for %s; continue with indicator-only fallback. err=%s",
+                        normalized_ticker,
+                        e_quote,
+                    )
+                try:
+                    us_ind_df = _call_akshare(
+                        ak.stock_financial_us_analysis_indicator_em,
                         symbol=normalized_ticker,
                         indicator="年报",
                     )
                 except Exception:
-                    us_ind_df = ak.stock_financial_us_analysis_indicator_em(symbol=normalized_ticker)
+                    us_ind_df = _call_akshare(
+                        ak.stock_financial_us_analysis_indicator_em, symbol=normalized_ticker
+                    )
                 if us_ind_df is not None and not us_ind_df.empty:
                     date_col = (
                         "REPORT_DATE"
@@ -2589,20 +2636,32 @@ def get_financial_metrics(
                         )
                     us_indicator_data = us_ind_df.iloc[0]
             elif market == MarketType.HK:
-                q_df = ak.stock_individual_basic_info_hk_xq(symbol=normalized_ticker)
-                if not q_df.empty:
-                    quote_map = _kv_from_item_value_df(q_df)
-                    if len(q_df) > 0:
-                        quote_data = q_df.iloc[0]
-                else:
-                    logger.warning(f"Could not fetch HK quote data for {normalized_ticker}")
                 try:
-                    hk_ind_df = ak.stock_financial_hk_analysis_indicator_em(
+                    q_df = _call_akshare(
+                        ak.stock_individual_basic_info_hk_xq, symbol=normalized_ticker
+                    )
+                    if not q_df.empty:
+                        quote_map = _kv_from_item_value_df(q_df)
+                        if len(q_df) > 0:
+                            quote_data = q_df.iloc[0]
+                    else:
+                        logger.warning(f"Could not fetch HK quote data for {normalized_ticker}")
+                except Exception as e_quote:
+                    logger.warning(
+                        "HK quote fetch failed for %s; continue with indicator-only fallback. err=%s",
+                        normalized_ticker,
+                        e_quote,
+                    )
+                try:
+                    hk_ind_df = _call_akshare(
+                        ak.stock_financial_hk_analysis_indicator_em,
                         symbol=normalized_ticker,
                         indicator="报告期",
                     )
                 except Exception:
-                    hk_ind_df = ak.stock_financial_hk_analysis_indicator_em(symbol=normalized_ticker)
+                    hk_ind_df = _call_akshare(
+                        ak.stock_financial_hk_analysis_indicator_em, symbol=normalized_ticker
+                    )
                 if hk_ind_df is not None and not hk_ind_df.empty:
                     date_col = (
                         "REPORT_DATE"
@@ -2624,7 +2683,9 @@ def get_financial_metrics(
 
                 total_shares = None
                 try:
-                    info_df = ak.stock_individual_info_em(symbol=normalized_ticker, timeout=20)
+                    info_df = _call_akshare(
+                        ak.stock_individual_info_em, symbol=normalized_ticker, timeout=20
+                    )
                     total_shares_series = info_df[
                         info_df["item"].astype(str).str.contains("总股本|股本", regex=True, na=False)
                     ]["value"]
@@ -2642,7 +2703,8 @@ def get_financial_metrics(
                 # Fetch Indicators
                 try:
                     current_year = datetime.now().year
-                    ind_df = ak.stock_financial_analysis_indicator(
+                    ind_df = _call_akshare(
+                        ak.stock_financial_analysis_indicator,
                         symbol=normalized_ticker, start_year=str(current_year - 1)
                     )
                     if not ind_df.empty:
@@ -2709,6 +2771,13 @@ def get_financial_metrics(
                 ) or _safe_numeric_with_cn_unit(
                     quote_map.get("pettm")
                 )
+                if market == MarketType.US:
+                    metric_data["price_to_book_ratio"] = _safe_numeric_with_cn_unit(
+                        quote_map.get("price_to_book_ratio")
+                    )
+                    metric_data["price_to_sales_ratio"] = _safe_numeric_with_cn_unit(
+                        quote_map.get("price_to_sales_ratio")
+                    )
             elif not indicator_data.empty:  # CN from indicators
                 metric_data["price_to_earnings_ratio"] = _safe_numeric_with_cn_unit(indicator_data.get("市盈率PE(TTM)"))
 
@@ -2967,19 +3036,22 @@ def search_line_items(
         # --- Fetch Raw Statement Data ---
         if market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]:
             try:
-                fetched_data["balance"] = ak.stock_financial_report_sina(
+                fetched_data["balance"] = _call_akshare(
+                    ak.stock_financial_report_sina,
                     stock=f"{market.value}{normalized_ticker}", symbol="资产负债表"
                 )
             except Exception as e:
                 logger.warning(f"Failed CN Balance Sheet fetch: {e}")
             try:
-                fetched_data["income"] = ak.stock_financial_report_sina(
+                fetched_data["income"] = _call_akshare(
+                    ak.stock_financial_report_sina,
                     stock=f"{market.value}{normalized_ticker}", symbol="利润表"
                 )
             except Exception as e:
                 logger.warning(f"Failed CN Income Statement fetch: {e}")
             try:
-                fetched_data["cashflow"] = ak.stock_financial_report_sina(
+                fetched_data["cashflow"] = _call_akshare(
+                    ak.stock_financial_report_sina,
                     stock=f"{market.value}{normalized_ticker}", symbol="现金流量表"
                 )
             except Exception as e:
@@ -2993,7 +3065,8 @@ def search_line_items(
             }
             for report_name_cn, key in report_map.items():
                 try:
-                    fetched_data[key] = ak.stock_financial_hk_report_em(
+                    fetched_data[key] = _call_akshare(
+                        ak.stock_financial_hk_report_em,
                         stock=normalized_ticker, symbol=report_name_cn
                     )
                 except Exception as e:
@@ -3187,18 +3260,23 @@ def search_line_items(
     if results and market == MarketType.HK:
         try:
             try:
-                hk_ind_df = ak.stock_financial_hk_analysis_indicator_em(
+                hk_ind_df = _call_akshare(
+                    ak.stock_financial_hk_analysis_indicator_em,
                     symbol=normalized_ticker, indicator="报告期"
                 )
             except Exception:
-                hk_ind_df = ak.stock_financial_hk_analysis_indicator_em(symbol=normalized_ticker)
+                hk_ind_df = _call_akshare(
+                    ak.stock_financial_hk_analysis_indicator_em, symbol=normalized_ticker
+                )
             if hk_ind_df is not None and not hk_ind_df.empty:
                 hk_ind_df["REPORT_DATE"] = pd.to_datetime(hk_ind_df["REPORT_DATE"], errors="coerce")
                 hk_ind_df = hk_ind_df.dropna(subset=["REPORT_DATE"]).sort_values(
                     "REPORT_DATE", ascending=False
                 )
                 try:
-                    q_df = ak.stock_individual_basic_info_hk_xq(symbol=normalized_ticker)
+                    q_df = _call_akshare(
+                        ak.stock_individual_basic_info_hk_xq, symbol=normalized_ticker
+                    )
                     q_map = _kv_from_item_value_df(q_df)
                     shares = _safe_numeric_with_cn_unit(q_map.get("numtissh"))
                 except Exception:
@@ -3242,11 +3320,14 @@ def search_line_items(
         try:
             if market == MarketType.HK:
                 try:
-                    ind_df = ak.stock_financial_hk_analysis_indicator_em(
+                    ind_df = _call_akshare(
+                        ak.stock_financial_hk_analysis_indicator_em,
                         symbol=normalized_ticker, indicator="报告期"
                     )
                 except Exception:
-                    ind_df = ak.stock_financial_hk_analysis_indicator_em(symbol=normalized_ticker)
+                    ind_df = _call_akshare(
+                        ak.stock_financial_hk_analysis_indicator_em, symbol=normalized_ticker
+                    )
                 if ind_df is not None and not ind_df.empty:
                     ind_df["REPORT_DATE"] = pd.to_datetime(ind_df["REPORT_DATE"], errors="coerce")
                     ind_df = ind_df.dropna(subset=["REPORT_DATE"]).sort_values(
@@ -3261,7 +3342,9 @@ def search_line_items(
                         # Shares are not in indicator table; try quote basic info if available.
                         if shares is None:
                             try:
-                                q_df = ak.stock_individual_basic_info_hk_xq(symbol=normalized_ticker)
+                                q_df = _call_akshare(
+                                    ak.stock_individual_basic_info_hk_xq, symbol=normalized_ticker
+                                )
                                 q_map = _kv_from_item_value_df(q_df)
                                 shares = _safe_numeric_with_cn_unit(q_map.get("numtissh"))
                             except Exception:
@@ -3286,7 +3369,9 @@ def search_line_items(
                         }
                         results.append(LineItem(**item_data))
             elif market in [MarketType.CHINA_SZ, MarketType.CHINA_SH, MarketType.CHINA_BJ]:
-                ind_df = ak.stock_financial_analysis_indicator(symbol=normalized_ticker, start_year="2020")
+                ind_df = _call_akshare(
+                    ak.stock_financial_analysis_indicator, symbol=normalized_ticker, start_year="2020"
+                )
                 if ind_df is not None and not ind_df.empty:
                     ind_df["日期"] = pd.to_datetime(ind_df["日期"], errors="coerce")
                     ind_df = ind_df.dropna(subset=["日期"]).sort_values("日期", ascending=False)
@@ -3305,11 +3390,14 @@ def search_line_items(
                         results.append(LineItem(**item_data))
             elif market == MarketType.US:
                 try:
-                    us_df = ak.stock_financial_us_analysis_indicator_em(
+                    us_df = _call_akshare(
+                        ak.stock_financial_us_analysis_indicator_em,
                         symbol=normalized_ticker, indicator="年报"
                     )
                 except Exception:
-                    us_df = ak.stock_financial_us_analysis_indicator_em(symbol=normalized_ticker)
+                    us_df = _call_akshare(
+                        ak.stock_financial_us_analysis_indicator_em, symbol=normalized_ticker
+                    )
                 if us_df is not None and not us_df.empty:
                     us_df["REPORT_DATE"] = pd.to_datetime(us_df["REPORT_DATE"], errors="coerce")
                     us_df = us_df.dropna(subset=["REPORT_DATE"]).sort_values(
@@ -3378,7 +3466,7 @@ def get_insider_trades(
             )
             return []
         # **VERIFY** column names from ak.stock_us_insider_trade output
-        df = ak.stock_us_insider_trade(symbol=normalized_ticker)
+        df = _call_akshare(ak.stock_us_insider_trade, symbol=normalized_ticker)
 
         if df is None or df.empty:
             logger.warning(f"No insider trade data found for {normalized_ticker}")
@@ -3446,7 +3534,7 @@ def get_stock_news(
     limit = max(1, min(limit, 100))
 
     try:
-        news_df = ak.stock_news_em(symbol=symbol)
+        news_df = _call_akshare(ak.stock_news_em, symbol=symbol)
     except Exception as e:
         logger.error("Error fetching news for %s: %s", symbol, e, exc_info=True)
         return []
@@ -3543,27 +3631,36 @@ def get_market_cap(
     market_cap = None
     try:
         if market == MarketType.US:
-            quote_df = ak.stock_individual_basic_info_us_xq(symbol=normalized_ticker)
-            quote_map = _kv_from_item_value_df(quote_df)
-            market_cap = (
-                _safe_numeric_with_cn_unit(quote_map.get("market_capital"))
-                or _safe_numeric_with_cn_unit(quote_map.get("market_cap"))
-                or _safe_numeric_with_cn_unit(quote_map.get("总市值"))
-            )
+            quote_map: dict[str, Any] = {}
+            try:
+                import yfinance as yf  # type: ignore
+
+                tk = yf.Ticker(normalized_ticker)
+                fast_info = getattr(tk, "fast_info", {}) or {}
+                info = getattr(tk, "info", {}) or {}
+                quote_map = {
+                    "market_cap": fast_info.get("market_cap") or info.get("marketCap"),
+                    "total_shares": fast_info.get("shares") or info.get("sharesOutstanding"),
+                }
+            except Exception as e_quote:
+                logger.warning(
+                    "US yfinance quote fetch failed for %s while getting market cap: %s",
+                    normalized_ticker,
+                    e_quote,
+                )
+
+            market_cap = _safe_numeric_with_cn_unit(quote_map.get("market_cap"))
             if market_cap is None:
                 latest_price = None
                 prices_list = get_prices(normalized_ticker, end_date=end_date)
                 if prices_list:
                     latest_price = prices_list[-1].close
-                shares = (
-                    _safe_numeric_with_cn_unit(quote_map.get("total_shares"))
-                    or _safe_numeric_with_cn_unit(quote_map.get("actual_issue_total_shares_num"))
-                )
+                shares = _safe_numeric_with_cn_unit(quote_map.get("total_shares"))
                 if latest_price is not None and shares is not None:
                     market_cap = latest_price * shares
 
         elif market == MarketType.HK:
-            quote_df = ak.stock_individual_basic_info_hk_xq(symbol=normalized_ticker)
+            quote_df = _call_akshare(ak.stock_individual_basic_info_hk_xq, symbol=normalized_ticker)
             quote_map = _kv_from_item_value_df(quote_df)
             market_cap = (
                 _safe_numeric_with_cn_unit(quote_map.get("market_value"))
@@ -3593,7 +3690,7 @@ def get_market_cap(
 
             total_shares = None
             try:
-                info_df = ak.stock_individual_info_em(symbol=normalized_ticker)
+                info_df = _call_akshare(ak.stock_individual_info_em, symbol=normalized_ticker)
                 total_shares_series = info_df[
                     info_df["item"].astype(str).str.contains("总股本|股本", regex=True, na=False)
                 ]["value"]
@@ -3744,140 +3841,3 @@ def get_price_df(
         provider=provider,
     )
     return prices_to_df(prices)
-
-
-# --- Example Usage (Optional) ---
-if __name__ == "__main__":
-    import logging
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    logger.setLevel(logging.INFO)  # Ensure module logger level is also INFO
-
-    # Test US Stock
-    print("\n--- Testing US Stock (AAPL) ---")
-    aapl_ticker = "AAPL"
-    try:
-        aapl_prices = get_prices(aapl_ticker, start_date="2024-01-01", end_date="2024-04-01")
-        if aapl_prices:
-            print(f"AAPL Prices (last 2): {aapl_prices[-2:]}")
-            aapl_df = prices_to_df(aapl_prices)
-            print(f"AAPL Price DataFrame tail:\n{aapl_df.tail(2)}")
-        else:
-            print("No AAPL price data found")
-    except Exception as e:
-        print(f"Error getting AAPL prices: {e}")
-
-    try:
-        aapl_metrics = get_financial_metrics(aapl_ticker)
-        print(f"AAPL Metrics: {aapl_metrics}")
-    except Exception as e:
-        print(f"Error getting AAPL metrics: {e}")
-
-    try:
-        aapl_cap = get_market_cap(aapl_ticker)
-        print(f"AAPL Market Cap: {aapl_cap}")
-    except Exception as e:
-        print(f"Error getting AAPL market cap: {e}")
-
-    try:
-        aapl_news = get_company_news(aapl_ticker, limit=1)
-        print(f"AAPL News (limit 1): {aapl_news}")
-    except Exception as e:
-        print(f"Error getting AAPL news: {e}")
-
-    try:
-        aapl_insider = get_insider_trades(aapl_ticker, limit=1)
-        print(f"AAPL Insider Trades (limit 1): {aapl_insider}")
-    except Exception as e:
-        print(f"Error getting AAPL insider trades: {e}")
-
-    try:
-        aapl_items = search_line_items(
-            aapl_ticker,
-        )  # Items ignored
-        print(f"AAPL Line Items (latest): {aapl_items}")
-    except Exception as e:
-        print(f"Error getting AAPL line items: {e}")
-
-    # Test HK Stock
-    print("\n--- Testing HK Stock (00700) ---")
-    tencent_ticker = "00700"  # Tencent
-    try:
-        tencent_prices = get_prices(tencent_ticker, start_date="2024-01-01", end_date="2024-04-01")
-        if tencent_prices:
-            print(f"Tencent Prices (last 2): {tencent_prices[-2:]}")
-            tencent_df = get_price_df(
-                tencent_ticker, start_date="2024-01-01", end_date="2024-04-01"
-            )
-            print(f"Tencent Price DataFrame tail:\n{tencent_df.tail(2)}")
-        else:
-            print("No Tencent price data found")
-    except Exception as e:
-        print(f"Error getting Tencent prices: {e}")
-
-    try:
-        tencent_metrics = get_financial_metrics(tencent_ticker)
-        print(f"Tencent Metrics: {tencent_metrics}")
-    except Exception as e:
-        print(f"Error getting Tencent metrics: {e}")
-
-    try:
-        tencent_cap = get_market_cap(tencent_ticker)
-        print(f"Tencent Market Cap: {tencent_cap}")
-    except Exception as e:
-        print(f"Error getting Tencent market cap: {e}")
-
-    try:
-        tencent_news = get_company_news(tencent_ticker, limit=1)
-        print(f"Tencent News (limit 1): {tencent_news}")
-    except Exception as e:
-        print(f"Error getting Tencent news: {e}")
-
-    try:
-        tencent_items = search_line_items(tencent_ticker, limit=1)
-        print(f"Tencent Line Items (latest): {tencent_items}")
-    except Exception as e:
-        print(f"Error getting Tencent line items: {e}")
-
-    # Test CN Stock
-    print("\n--- Testing CN Stock (600519) ---")
-    moutai_ticker = "600519"  # Kweichow Moutai
-    try:
-        moutai_prices = get_prices(moutai_ticker, start_date="2024-01-01", end_date="2024-04-01")
-        if moutai_prices:
-            print(f"Moutai Prices (last 2): {moutai_prices[-2:]}")
-            moutai_df = get_price_df(
-                moutai_ticker, start_date="2024-01-01", end_date="2024-04-01"
-            )
-            print(f"Moutai Price DataFrame tail:\n{moutai_df.tail(2)}")
-        else:
-            print("No Moutai price data found")
-    except Exception as e:
-        print(f"Error getting Moutai prices: {e}")
-
-    try:
-        moutai_metrics = get_financial_metrics(moutai_ticker)
-        print(f"Moutai Metrics: {moutai_metrics}")
-    except Exception as e:
-        print(f"Error getting Moutai metrics: {e}")
-
-    try:
-        moutai_cap = get_market_cap(moutai_ticker)
-        print(f"Moutai Market Cap: {moutai_cap}")
-    except Exception as e:
-        print(f"Error getting Moutai market cap: {e}")
-
-    try:
-        moutai_news = get_company_news(moutai_ticker, limit=1)
-        print(f"Moutai News (limit 1): {moutai_news}")
-    except Exception as e:
-        print(f"Error getting Moutai news: {e}")
-
-    try:
-        moutai_items = search_line_items(moutai_ticker, limit=2)  # Get latest 2 periods
-        print(f"Moutai Line Items (latest 2): {moutai_items}")
-    except Exception as e:
-        print(f"Error getting Moutai line items: {e}")

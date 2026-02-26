@@ -18,7 +18,7 @@ class Scratchpad:
 
     @property
     def file_path(self) -> Path:
-        root = self.base_dir or (OMNIX_PATH / "financial" / "scratchpad")
+        root = self.base_dir or (OMNIX_PATH / "omnifinan" / "logs" / "scratchpad")
         root.mkdir(parents=True, exist_ok=True)
         return root / f"{self.run_id}.jsonl"
 
