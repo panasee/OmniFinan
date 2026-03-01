@@ -64,6 +64,7 @@ exclude = ["tests*", "docs*", "examples*", "*.tests", "*.tests.*"]
 include-package-data = true
 
 [tool.setuptools.package-data]
+omnifinan = ["docs/*.md"]
 
 [tool.ruff]
 line-length = 100
