@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unified API module for accessing US, HK, and Chinese stock market data using akshare.
 
 This module provides a unified interface for accessing stock market data from
@@ -312,6 +312,7 @@ def _normalize_macro_series(
             "previous": None,
             "trend": "flat",
             "error": "empty dataframe",
+            "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
     local_date_col = None
@@ -329,6 +330,7 @@ def _normalize_macro_series(
             "previous": None,
             "trend": "flat",
             "error": "could not infer date/value columns",
+            "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
     work = df[[use_date_col, use_value_col]].copy()
@@ -372,6 +374,7 @@ def _normalize_macro_series(
         "previous": previous,
         "trend": trend,
         "error": None,
+        "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if observations and (start_date or end_date) and full_work.shape[0] > work.shape[0]:
         payload["note"] = "window_filtered_or_fallback_latest_used"
@@ -440,6 +443,7 @@ def _macro_error_payload(series_name: str, source: str, error: str) -> dict[str,
         "previous": None,
         "trend": "flat",
         "error": error,
+        "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
 

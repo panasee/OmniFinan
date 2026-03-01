@@ -348,6 +348,41 @@ class UnifiedDataService:
             return 1
         return None
 
+    def _min_refetch_seconds(self, cycle_days: int | None) -> int:
+        """Minimum seconds between fetch attempts for a series, based on its update frequency."""
+        if cycle_days is None:
+            return 6 * 3600
+        if cycle_days <= 1:
+            return 6 * 3600
+        if cycle_days <= 7:
+            return 24 * 3600
+        if cycle_days <= 30:
+            return 3 * 24 * 3600
+        if cycle_days <= 90:
+            return 7 * 24 * 3600
+        return 14 * 24 * 3600
+
+    def _recently_fetched(
+        self,
+        val: dict[str, Any],
+        cycle_days: int | None,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Return True if the series was fetched recently enough that re-fetching is unnecessary."""
+        fetched_at = val.get("fetched_at")
+        if not fetched_at and isinstance(payload, dict):
+            fetched_at = payload.get("snapshot_at")
+        if not fetched_at:
+            return False
+        fetched_dt = self._parse_datetime(fetched_at)
+        if fetched_dt is None:
+            return False
+        age_seconds = (datetime.now() - fetched_dt).total_seconds()
+        cooldown = self._min_refetch_seconds(cycle_days)
+        if val.get("fetched_at") is None and isinstance(payload, dict) and payload.get("snapshot_at"):
+            cooldown = max(cooldown, 7 * 24 * 3600)
+        return age_seconds < cooldown
+
     def _macro_stale_keys(self, payload: dict[str, Any] | None, as_of: date) -> list[str]:
         if not isinstance(payload, dict):
             return []
@@ -355,32 +390,49 @@ class UnifiedDataService:
         if not isinstance(series, dict):
             return []
         stale: list[str] = []
+        cooldown_skipped: list[str] = []
         for key, val in series.items():
             if not isinstance(val, dict):
                 stale.append(str(key))
                 continue
             if self._is_terminal_macro_unavailable(str(key), val):
                 continue
+            cycle_days = self._macro_cycle_days(str(key), val)
             if val.get("error"):
-                stale.append(str(key))
+                if not self._recently_fetched(val, cycle_days, payload):
+                    stale.append(str(key))
+                else:
+                    cooldown_skipped.append(str(key))
                 continue
             obs = val.get("observations", [])
             latest = val.get("latest")
             has_obs = isinstance(obs, list) and len(obs) > 0
             has_latest = isinstance(latest, dict) and latest.get("value") is not None
             if not has_obs and not has_latest:
-                stale.append(str(key))
+                if not self._recently_fetched(val, cycle_days, payload):
+                    stale.append(str(key))
+                else:
+                    cooldown_skipped.append(str(key))
                 continue
             last_date = self._macro_latest_date(val)
             if last_date is None:
-                stale.append(str(key))
+                if not self._recently_fetched(val, cycle_days, payload):
+                    stale.append(str(key))
+                else:
+                    cooldown_skipped.append(str(key))
                 continue
-            cycle_days = self._macro_cycle_days(str(key), val)
-            # Prefer per-series publication cycle, and only fallback to 30 days
-            # when cycle inference is not available.
-            stale_threshold_days = 30 if cycle_days is None else max(1, int(cycle_days) * 3)
+            stale_threshold_days = 30 if cycle_days is None else max(7, int(cycle_days) * 3)
             if (as_of - last_date).days > stale_threshold_days:
-                stale.append(str(key))
+                if not self._recently_fetched(val, cycle_days, payload):
+                    stale.append(str(key))
+                else:
+                    cooldown_skipped.append(str(key))
+        if cooldown_skipped:
+            logger.info(
+                "Macro staleness check: %d series skipped (recently fetched): %s",
+                len(cooldown_skipped),
+                ",".join(cooldown_skipped[:10]),
+            )
         return stale
 
     def _macro_update_summary(self, before: dict[str, Any] | None, after: dict[str, Any]) -> str:
