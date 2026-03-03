@@ -60,7 +60,15 @@ def normalize_ticker(ticker: str) -> str:
     Normalizes the ticker symbol for use with akshare functions.
     Removes common suffixes like .SH, .SZ, .HK, .O, .N etc.
     Keeps the core identifier.
+
+    For crypto tickers (e.g. "BTC", "BTC/USDT", "BTC-USDT"), normalizes to
+    canonical pair format like "BTC-USDT".  Bare symbols default to USDT quote.
     """
+    from .data.symbols import is_crypto_ticker, normalize_crypto_ticker
+
+    if is_crypto_ticker(ticker):
+        return normalize_crypto_ticker(ticker)
+
     # Remove common exchange suffixes
     ticker = re.sub(
         r"\.(US|SH|SZ|HK|O|N|L|DE|PA|AS|MI|VX|SW|CO|HE|ST|OL|IC|KS|KQ|TWO|TW|BK|CR|SA|TL|JK|NZ|AX|IS|TO|NE|BR|VI)$",
@@ -105,8 +113,16 @@ def detect_market(normalized_ticker: str) -> MarketType:
     Also distinguishes between Shanghai (SH) and Shenzhen (SZ) stocks within China market.
 
     Returns:
-        MarketType: The market type (US, CHINA, HK)
+        MarketType: The market type (US, CHINA, HK, CRYPTO)
     """
+    from .data.symbols import is_crypto_ticker
+
+    # Crypto check — must come before US regex since bare symbols like BTC
+    # would otherwise match the 1-5 uppercase letter US pattern.
+    if is_crypto_ticker(normalized_ticker):
+        logger.debug(f"Detected Market: CRYPTO for {normalized_ticker}")
+        return MarketType.CRYPTO
+
     # Hong Kong: 5 digits (already zero-padded by normalize_ticker)
     if re.fullmatch(r"^\d{5}$", normalized_ticker):
         # Basic check, might need refinement if clashes occur (e.g., US OTC)
@@ -3534,11 +3550,23 @@ def get_stock_news(
     limit: int = 10,
 ) -> list[CompanyNews]:
     """Fetch and normalize company news for a symbol."""
+    from .data.symbols import is_crypto_ticker
+
     market = detect_market(symbol)
     limit = max(1, min(limit, 100))
 
+    # For crypto tickers, extract base symbol for AkShare news search.
+    # AkShare stock_news_em uses keyword matching, so "BTC" works but
+    # "BTC-USDT" does not.
+    search_symbol = symbol
+    if is_crypto_ticker(symbol):
+        for sep in ("-", "/"):
+            if sep in symbol:
+                search_symbol = symbol.split(sep, 1)[0]
+                break
+
     try:
-        news_df = _call_akshare(ak.stock_news_em, symbol=symbol)
+        news_df = _call_akshare(ak.stock_news_em, symbol=search_symbol)
     except Exception as e:
         logger.error("Error fetching news for %s: %s", symbol, e, exc_info=True)
         return []

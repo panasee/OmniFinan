@@ -13,6 +13,7 @@ class MarketType(str, Enum):
     CHINA_SH = "sh"
     CHINA_BJ = "bj"
     HK = "hongkong"
+    CRYPTO = "crypto"
     UNKNOWN = "unknown"
 
 

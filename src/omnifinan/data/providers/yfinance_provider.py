@@ -142,8 +142,7 @@ class YFinanceProvider(DataProvider):
         end_date: str | None = None,
         limit: int = 10,
     ) -> list[CompanyNews]:
-        if is_crypto_ticker(ticker):
-            return []
+        # Crypto news is available via AkShare fallback, so don't block it.
         return self._fallback.get_company_news(ticker, start_date, end_date, limit)
 
     def get_insider_trades(
