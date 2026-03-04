@@ -2511,6 +2511,88 @@ def get_prices(
     return prices_list
 
 
+def get_stock_option_chain(
+    symbol: str,
+    expiration: str | None = None,
+    option_type: Literal["call", "put"] | None = None,
+    strike: float | None = None,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
+    snapshot_mode: Literal["prev_close", "realtime"] = "prev_close",
+    snapshot_date: str | None = None,
+    provider: Literal["auto", "marketdata", "yfinance"] = "auto",
+    extra_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fetch US stock option chain from optional providers."""
+    provider_name = str(provider or "auto").strip().lower()
+    if provider_name not in {"auto", "marketdata", "yfinance"}:
+        raise ValueError("provider must be one of {'auto', 'marketdata', 'yfinance'}")
+
+    if provider_name in {"auto", "marketdata"}:
+        from .data.providers.marketdata_provider import MarketDataOptionsProvider
+
+        try:
+            return MarketDataOptionsProvider().get_stock_option_chain(
+                symbol=symbol,
+                expiration=expiration,
+                option_type=option_type,
+                strike=strike,
+                min_dte=min_dte,
+                max_dte=max_dte,
+                snapshot_mode=snapshot_mode,
+                snapshot_date=snapshot_date,
+                extra_params=extra_params,
+            )
+        except Exception:
+            if provider_name == "marketdata":
+                raise
+
+    from .data.providers.yfinance_options_provider import YFinanceOptionsProvider
+
+    return YFinanceOptionsProvider().get_stock_option_chain(
+        symbol=symbol,
+        expiration=expiration,
+        option_type=option_type,
+        strike=strike,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        snapshot_mode=snapshot_mode,
+        snapshot_date=snapshot_date,
+        extra_params=extra_params,
+    )
+
+
+def get_futures_option_chain(
+    symbol: str,
+    expiration: str | None = None,
+    option_type: Literal["call", "put"] | None = None,
+    strike: float | None = None,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
+    snapshot_mode: Literal["prev_close", "realtime"] = "prev_close",
+    snapshot_date: str | None = None,
+    provider: Literal["auto", "marketdata"] = "auto",
+    extra_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fetch futures option chain (MarketData currently)."""
+    provider_name = str(provider or "auto").strip().lower()
+    if provider_name not in {"auto", "marketdata"}:
+        raise ValueError("futures options provider must be one of {'auto', 'marketdata'}")
+    from .data.providers.marketdata_provider import MarketDataOptionsProvider
+
+    return MarketDataOptionsProvider().get_futures_option_chain(
+        symbol=symbol,
+        expiration=expiration,
+        option_type=option_type,
+        strike=strike,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        snapshot_mode=snapshot_mode,
+        snapshot_date=snapshot_date,
+        extra_params=extra_params,
+    )
+
+
 def get_financial_metrics(
     ticker: str,
     end_date: str | None = None,

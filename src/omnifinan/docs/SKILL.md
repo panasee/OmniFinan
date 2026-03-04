@@ -49,7 +49,8 @@ src/omnifinan/
 │       ├── akshare_provider.py
 │       ├── yfinance_provider.py
 │       ├── finnhub_provider.py
-│       └── sec_edgar_provider.py
+│       ├── sec_edgar_provider.py
+│       └── marketdata_provider.py   # options-only provider
 ├── analysis/
 │   ├── indicators.py        # XMA, cross_over, cross_under (TA-Lib wrappers)
 │   ├── transform.py         # Feature engineering: returns, rolling features
@@ -115,6 +116,7 @@ Analyst agents (run in parallel after market_data_agent):
 | YFinance | `"yfinance"`, `"yf"`, `"yahoo"` | US, global, crypto | Prices, financials, news |
 | Finnhub | `"finnhub"` | US | Prices, financials, news, insider trades |
 | SEC EDGAR | `"sec_edgar"`, `"sec"` | US | Financial metrics, line items from XBRL |
+| MarketData (options-only) | n/a (direct options APIs) | US stocks, futures options | Option chain fetch only |
 
 Create with: `create_data_provider("akshare")`
 
@@ -138,6 +140,10 @@ Wraps a `DataProvider` with intelligent caching via `DataCache`. Key behaviors:
 - **Company news**: Incremental forward/backward fetch, deduplicated by URL/title
 - **Insider trades**: Incremental fetch by filing_date
 - **Crypto**: Auto-routes to YFinance for crypto tickers
+- **Options**:
+  - `get_stock_option_chain()` defaults to `provider="auto"` (MarketData first, then YFinance fallback)
+  - `get_futures_option_chain()` uses MarketData
+  - default snapshot mode is previous-business-day close (`snapshot_mode="prev_close"`)
 
 ```python
 from omnifinan.data.cache import DataCache
@@ -152,6 +158,8 @@ service = UnifiedDataService(
 prices = service.get_prices("600519", "2025-01-01", "2025-12-31")
 macro = service.get_macro_indicators("2025-01-01", "2025-12-31")
 structured = service.get_macro_indicators_structured("2025-01-01", "2025-12-31")
+stock_opts = service.get_stock_option_chain("AAPL", expiration="2026-06-19")
+fut_opts = service.get_futures_option_chain("ES", expiration="2026-06-19")
 ```
 
 ### Macro Data Architecture
@@ -171,73 +179,87 @@ structured = service.get_macro_indicators_structured("2025-01-01", "2025-12-31")
 - `metrics`: per-series cards with yoy, mom, qoq, trend_short, trend_medium, volatility
 - `chart_data.long`: flattened list for plotting
 
-## Common Workflows
+## LLM Execution Guidance
 
-### Run Full Analysis (CLI)
+This section is for LLM runtime orchestration guidance only.
 
-```bash
-python -m omnifinan --tickers 600519 --start-date 2025-01-01 --end-date 2025-06-30
-```
+### Preferred Data-First API Path
 
-### Run Full Analysis (Python)
+For non-LLM analytics tasks, prefer direct `UnifiedDataService` APIs instead of full
+multi-agent orchestration:
 
-```python
-from omnifinan import run_hedge_fund
+- `get_prices`
+- `get_financial_metrics`
+- `get_line_items`
+- `get_company_news`
+- `get_insider_trades`
+- `get_macro_indicators`
+- `get_macro_indicators_structured`
+- `get_stock_option_chain`
+- `get_futures_option_chain`
+- `get_stock_option_chain_analytics` (new; non-LLM)
+- `get_futures_option_chain_analytics` (new; non-LLM)
 
-result = run_hedge_fund(
-    tickers=["600519"],
-    start_date="2025-01-01",
-    end_date="2025-06-30",
-    portfolio={"cash": 100000, "margin_requirement": 0.0, ...},
-    show_reasoning=True,
-    selected_analysts=["technical_analyst", "fundamentals_analyst", "macro_analyst"],
-    model_name="deepseek-chat",
-    provider_api="deepseek",
-    language="Chinese",
-)
-# result = {"decisions": {...}, "analyst_signals": {...}, "run_id": "..."}
-```
+### Option Analytics (Non-LLM) Guidance
 
-### Run Backtest
+When the task asks for IV/skew/term-structure/Greeks, use analytics APIs first:
 
-```python
-from omnifinan.backtester import Backtester
-from omnifinan.core.workflow import run_hedge_fund
+- `UnifiedDataService.get_stock_option_chain_analytics(...)`
+- `UnifiedDataService.get_futures_option_chain_analytics(...)`
 
-bt = Backtester(
-    agent=run_hedge_fund,
-    tickers=["600519"],
-    start_date="2024-01-01",
-    end_date="2025-01-01",
-    initial_capital=100000,
-)
-bt.run_backtest()
-```
+Market compatibility rule:
+- China A-share / HK equity tickers do not have options support in current provider stack.
+- For those tickers, stock-option APIs return `meta.source = "fixed_sources_unavailable"` with explicit `meta.error`.
+- LLM should continue the broader analysis flow without treating this as a fatal error.
+- Crypto pair symbols are normalized to base asset for options endpoints:
+  - `BTC-USDT`, `BTC-USD`, `BTCUSDT` -> `BTC`
+  - `ETH-USDT`, `ETH-USD`, `ETHUSDT` -> `ETH`
 
-### REST API
+Return contract from analytics APIs:
 
-```python
-from omnifinan.presentation.api import create_app
-app = create_app()
-app.run()
-# POST /analyze with JSON body
-# GET /healthz
-```
+- `meta` (inherits chain metadata + `analytics_version`)
+- `data` (raw option rows)
+- `raw` (provider raw payload)
+- `analytics.summary` (`option_count`, `enriched_count`, `underlying_price`, `median_iv`)
+- `analytics.surface` (per-contract normalized metrics with IV/Greeks)
+- `analytics.term_structure` (ATM IV by expiry)
+- `analytics.skew_by_expiry` (`risk_reversal_25d`, `butterfly_25d`, ATM IV)
+- `analytics.smile_by_expiry` (IV smile points by strike/moneyness per expiry)
+- `analytics.max_pain` (overall and per-expiry max pain strike)
+- `analytics.levels` (primary support/resistance from put/call OI walls)
+- `analytics.implied_vs_realized` (`current_atm_iv`, `historical_volatility`, `iv_minus_hv`, `iv_to_hv_ratio`)
+- `analytics.summary.iv_historical_percentile` (requires `iv_history` input)
+- `analytics.errors` (explicit calculation issues)
 
-### Visualization
+### LLM-as-Glue Fallback Pattern
 
-```python
-from omnifinan.visualize import StockFigure, create_macro_figure
+If a step requires semantic generation but nested runtime model calls are not desired:
 
-# Stock chart with indicators
-fig = StockFigure(1, 1, 1, width=1000, height=3000)
-fig.add_candle_trace(0, 0, data_df=df, market="A")
-fig.add_volume_trace(0, 0)
-fig.preset_main_indicators(0, 0)
+1. Pause at the step and collect exact upstream state.
+2. Generate the structured output in the current LLM context.
+3. Write back to the exact state path expected downstream.
+4. Resume remaining deterministic steps.
 
-# Macro dashboard from structured data
-macro_fig = create_macro_figure(structured, dimensions=["growth", "inflation", "liquidity"])
-```
+Required compatibility write-back path example:
+
+- `state["data"]["analyst_signals"]["sentiment_agent"][ticker]`
+- fields: `signal`, `confidence`, `reasoning`
+
+Keep external contracts stable:
+
+- Top-level result keys (e.g., `decisions`, `analyst_signals`)
+- Macro structured keys (`meta`, `dimensions`, `metrics`, `chart_data`)
+
+### Orchestration Interfaces (Still Available)
+
+These orchestration interfaces remain supported; use them when task intent is
+end-to-end execution rather than atomic data/analytics calls.
+
+- `omnifinan.run_hedge_fund(...)` (full multi-agent workflow)
+- `omnifinan.core.workflow.run_hedge_fund(...)` (workflow module entry)
+- `omnifinan.backtester.Backtester` (backtest runner)
+- `omnifinan.presentation.api.create_app()` (REST API entry)
+- `omnifinan.visualize.StockFigure` / `omnifinan.visualize.create_macro_figure` (charting)
 
 ## Configuration
 

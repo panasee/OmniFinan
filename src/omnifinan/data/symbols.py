@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 
 _CRYPTO_QUOTES = {
     "USD",
@@ -96,3 +97,49 @@ def normalize_crypto_ticker(ticker: str) -> str:
 
     # Fallback: return as-is with USDT
     return f"{symbol}-USDT"
+
+
+def is_hk_equity_ticker(ticker: str | None) -> bool:
+    """Return True if ticker looks like a Hong Kong equity code."""
+    if not ticker:
+        return False
+    symbol = ticker.strip().upper()
+    if symbol.endswith(".HK"):
+        return True
+    return bool(re.fullmatch(r"\d{5}", symbol))
+
+
+def is_china_a_equity_ticker(ticker: str | None) -> bool:
+    """Return True if ticker looks like a China A-share code."""
+    if not ticker:
+        return False
+    symbol = ticker.strip().upper()
+    if symbol.endswith(".SH") or symbol.endswith(".SZ") or symbol.endswith(".BJ"):
+        return True
+    return bool(re.fullmatch(r"\d{6}", symbol))
+
+
+def is_non_option_equity_market_ticker(ticker: str | None) -> bool:
+    """Return True for equity tickers where this library does not support options."""
+    return is_china_a_equity_ticker(ticker) or is_hk_equity_ticker(ticker)
+
+
+def normalize_crypto_option_underlying(ticker: str | None) -> str:
+    """Normalize crypto symbols for options endpoints to base asset.
+
+    Examples:
+    - BTC-USDT -> BTC
+    - BTC-USD  -> BTC
+    - BTCUSDT  -> BTC
+    - ETH      -> ETH
+    """
+    symbol = (ticker or "").strip().upper()
+    if not symbol:
+        return symbol
+    if not is_crypto_ticker(symbol):
+        return symbol
+    normalized = normalize_crypto_ticker(symbol)
+    if "-" in normalized:
+        base, _quote = normalized.split("-", 1)
+        return base
+    return normalized

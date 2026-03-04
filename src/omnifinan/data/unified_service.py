@@ -9,10 +9,17 @@ from typing import Any
 
 from pyomnix.omnix_logger import get_logger
 
+from ..analysis.options import compute_chain_analytics
 from .cache import DataCache
 from .providers.base import DataProvider
+from .providers.marketdata_provider import MarketDataOptionsProvider
+from .providers.yfinance_options_provider import YFinanceOptionsProvider
 from .providers.yfinance_provider import YFinanceProvider
-from .symbols import is_crypto_ticker
+from .symbols import (
+    is_crypto_ticker,
+    is_non_option_equity_market_ticker,
+    normalize_crypto_option_underlying,
+)
 
 logger = get_logger("unified_data_service")
 
@@ -23,6 +30,8 @@ class UnifiedDataService:
         self.cache = cache or DataCache()
         self.ttl_seconds = ttl_seconds
         self._crypto_provider: DataProvider | None = None
+        self._options_provider: MarketDataOptionsProvider | None = None
+        self._yf_options_provider: YFinanceOptionsProvider | None = None
         self.cache.cleanup_expired(ttl_seconds)
 
     def _get_crypto_provider(self) -> DataProvider:
@@ -30,8 +39,31 @@ class UnifiedDataService:
             self._crypto_provider = YFinanceProvider()
         return self._crypto_provider
 
+    def _get_options_provider(self) -> MarketDataOptionsProvider:
+        if self._options_provider is None:
+            self._options_provider = MarketDataOptionsProvider()
+        return self._options_provider
+
+    def _get_yf_options_provider(self) -> YFinanceOptionsProvider:
+        if self._yf_options_provider is None:
+            self._yf_options_provider = YFinanceOptionsProvider()
+        return self._yf_options_provider
+
     def _ticker_key(self, ticker: str) -> str:
         return ticker.upper().strip()
+
+    def _unsupported_stock_option_payload(self, symbol: str, reason: str) -> dict[str, Any]:
+        clean_symbol = str(symbol or "").strip().upper()
+        return {
+            "meta": {
+                "source": "fixed_sources_unavailable",
+                "asset_kind": "stock_option",
+                "symbol": clean_symbol,
+                "error": reason,
+            },
+            "data": [],
+            "raw": {},
+        }
 
     def _model_dump_list(self, items: list[Any]) -> list[dict[str, Any]]:
         dumped: list[dict[str, Any]] = []
@@ -928,3 +960,337 @@ class UnifiedDataService:
         filtered = self._filter_by_date_range(stored, "filing_date", start_date, end_date)
         filtered = self._sort_by_date(filtered, "filing_date", descending=True)
         return filtered[:limit]
+
+    def get_stock_option_chain(
+        self,
+        symbol: str,
+        expiration: str | None = None,
+        option_type: str | None = None,
+        strike: float | None = None,
+        min_dte: int | None = None,
+        max_dte: int | None = None,
+        snapshot_mode: str = "prev_close",
+        snapshot_date: str | None = None,
+        provider: str = "auto",
+        force: bool = False,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if is_non_option_equity_market_ticker(symbol):
+            return self._unsupported_stock_option_payload(
+                symbol,
+                "stock options are not supported for China A-share/HK equities in current providers",
+            )
+        routed_symbol = normalize_crypto_option_underlying(symbol)
+        params = {
+            "symbol": routed_symbol,
+            "requested_symbol": symbol,
+            "expiration": expiration,
+            "type": option_type,
+            "strike": strike,
+            "min_dte": min_dte,
+            "max_dte": max_dte,
+            "snapshot_mode": snapshot_mode,
+            "snapshot_date": snapshot_date,
+            "provider": provider,
+            "extra_params": extra_params or {},
+        }
+        if not force:
+            hit = self.cache.get("stock_option_chain", params, ttl_seconds=self.ttl_seconds)
+            if isinstance(hit, dict):
+                return hit
+
+        p = str(provider or "auto").strip().lower()
+        if p not in {"auto", "marketdata", "yfinance"}:
+            raise ValueError("provider must be one of {'auto', 'marketdata', 'yfinance'}")
+
+        payload: dict[str, Any] | None = None
+        if p in {"auto", "marketdata"}:
+            try:
+                payload = self._get_options_provider().get_stock_option_chain(
+                    symbol=routed_symbol,
+                    expiration=expiration,
+                    option_type=option_type,
+                    strike=strike,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    snapshot_mode=snapshot_mode,
+                    snapshot_date=snapshot_date,
+                    extra_params=extra_params,
+                )
+            except Exception:
+                if p == "marketdata":
+                    raise
+        if payload is None:
+            payload = self._get_yf_options_provider().get_stock_option_chain(
+                symbol=routed_symbol,
+                expiration=expiration,
+                option_type=option_type,
+                strike=strike,
+                min_dte=min_dte,
+                max_dte=max_dte,
+                snapshot_mode=snapshot_mode,
+                snapshot_date=snapshot_date,
+                extra_params=extra_params,
+            )
+        self.cache.set("stock_option_chain", params, payload)
+        return payload
+
+    def get_futures_option_chain(
+        self,
+        symbol: str,
+        expiration: str | None = None,
+        option_type: str | None = None,
+        strike: float | None = None,
+        min_dte: int | None = None,
+        max_dte: int | None = None,
+        snapshot_mode: str = "prev_close",
+        snapshot_date: str | None = None,
+        provider: str = "auto",
+        force: bool = False,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        routed_symbol = normalize_crypto_option_underlying(symbol)
+        params = {
+            "symbol": routed_symbol,
+            "requested_symbol": symbol,
+            "expiration": expiration,
+            "type": option_type,
+            "strike": strike,
+            "min_dte": min_dte,
+            "max_dte": max_dte,
+            "snapshot_mode": snapshot_mode,
+            "snapshot_date": snapshot_date,
+            "provider": provider,
+            "extra_params": extra_params or {},
+        }
+        if not force:
+            hit = self.cache.get("futures_option_chain", params, ttl_seconds=self.ttl_seconds)
+            if isinstance(hit, dict):
+                return hit
+        p = str(provider or "auto").strip().lower()
+        if p not in {"auto", "marketdata"}:
+            raise ValueError("futures options provider must be one of {'auto', 'marketdata'}")
+        payload = self._get_options_provider().get_futures_option_chain(
+            symbol=routed_symbol,
+            expiration=expiration,
+            option_type=option_type,
+            strike=strike,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            snapshot_mode=snapshot_mode,
+            snapshot_date=snapshot_date,
+            extra_params=extra_params,
+        )
+        self.cache.set("futures_option_chain", params, payload)
+        return payload
+
+    def get_stock_option_chain_analytics(
+        self,
+        symbol: str,
+        expiration: str | None = None,
+        option_type: str | None = None,
+        strike: float | None = None,
+        min_dte: int | None = None,
+        max_dte: int | None = None,
+        snapshot_mode: str = "prev_close",
+        snapshot_date: str | None = None,
+        provider: str = "auto",
+        force: bool = False,
+        extra_params: dict[str, Any] | None = None,
+        underlying_price: float | None = None,
+        risk_free_rate: float = 0.02,
+        dividend_yield: float = 0.0,
+        iv_history: list[float] | None = None,
+        price_history: list[dict[str, Any]] | None = None,
+        include_realized_vol: bool = True,
+        hv_lookback_days: int = 20,
+    ) -> dict[str, Any]:
+        if is_non_option_equity_market_ticker(symbol):
+            payload = self._unsupported_stock_option_payload(
+                symbol,
+                "stock options analytics are unavailable for China A-share/HK equities",
+            )
+            return {
+                "meta": {**payload["meta"], "analytics_version": "options_analytics_v1"},
+                "data": [],
+                "raw": {},
+                "analytics": {
+                    "summary": {
+                        "option_count": 0,
+                        "enriched_count": 0,
+                        "underlying_price": None,
+                        "median_iv": None,
+                        "iv_historical_percentile": None,
+                    },
+                    "surface": [],
+                    "term_structure": [],
+                    "skew_by_expiry": [],
+                    "smile_by_expiry": [],
+                    "max_pain": {"overall": None, "by_expiry": []},
+                    "levels": {},
+                    "implied_vs_realized": {},
+                    "errors": [payload["meta"]["error"]],
+                },
+            }
+        routed_symbol = normalize_crypto_option_underlying(symbol)
+        params = {
+            "symbol": routed_symbol,
+            "requested_symbol": symbol,
+            "expiration": expiration,
+            "type": option_type,
+            "strike": strike,
+            "min_dte": min_dte,
+            "max_dte": max_dte,
+            "snapshot_mode": snapshot_mode,
+            "snapshot_date": snapshot_date,
+            "provider": provider,
+            "extra_params": extra_params or {},
+            "underlying_price": underlying_price,
+            "risk_free_rate": risk_free_rate,
+            "dividend_yield": dividend_yield,
+            "iv_history_len": len(iv_history) if isinstance(iv_history, list) else 0,
+            "price_history_len": len(price_history) if isinstance(price_history, list) else 0,
+            "include_realized_vol": include_realized_vol,
+            "hv_lookback_days": hv_lookback_days,
+            "analytics_version": "options_analytics_v1",
+        }
+        if not force:
+            hit = self.cache.get("stock_option_chain_analytics", params, ttl_seconds=self.ttl_seconds)
+            if isinstance(hit, dict):
+                return hit
+
+        payload = self.get_stock_option_chain(
+            symbol=routed_symbol,
+            expiration=expiration,
+            option_type=option_type,
+            strike=strike,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            snapshot_mode=snapshot_mode,
+            snapshot_date=snapshot_date,
+            provider=provider,
+            force=force,
+            extra_params=extra_params,
+        )
+        rows = payload.get("data", [])
+        resolved_snapshot = snapshot_date or str(payload.get("meta", {}).get("snapshot_date") or "")
+        hv_prices = price_history
+        if include_realized_vol and not isinstance(hv_prices, list):
+            try:
+                end_dt = self._parse_date(resolved_snapshot) or date.today()
+                # Pull enough bars to account for weekends/holidays.
+                start_dt = end_dt - timedelta(days=max(hv_lookback_days * 3, 60))
+                hv_prices = self._model_dump_list(
+                    self.get_prices(
+                        ticker=symbol,
+                        start_date=self._date_to_str(start_dt),
+                        end_date=self._date_to_str(end_dt),
+                    )
+                )
+            except Exception:
+                hv_prices = []
+        analytics = compute_chain_analytics(
+            rows if isinstance(rows, list) else [],
+            underlying_price=underlying_price,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            snapshot_date=resolved_snapshot,
+            price_history=hv_prices if isinstance(hv_prices, list) else [],
+            iv_history=iv_history if isinstance(iv_history, list) else None,
+            hv_lookback_days=hv_lookback_days,
+        )
+
+        result = {
+            "meta": {
+                **(payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}),
+                "analytics_version": "options_analytics_v1",
+            },
+            "data": rows if isinstance(rows, list) else [],
+            "raw": payload.get("raw", {}) if isinstance(payload.get("raw"), dict) else {},
+            "analytics": analytics,
+        }
+        self.cache.set("stock_option_chain_analytics", params, result)
+        return result
+
+    def get_futures_option_chain_analytics(
+        self,
+        symbol: str,
+        expiration: str | None = None,
+        option_type: str | None = None,
+        strike: float | None = None,
+        min_dte: int | None = None,
+        max_dte: int | None = None,
+        snapshot_mode: str = "prev_close",
+        snapshot_date: str | None = None,
+        provider: str = "auto",
+        force: bool = False,
+        extra_params: dict[str, Any] | None = None,
+        underlying_price: float | None = None,
+        risk_free_rate: float = 0.02,
+        dividend_yield: float = 0.0,
+        iv_history: list[float] | None = None,
+        price_history: list[dict[str, Any]] | None = None,
+        hv_lookback_days: int = 20,
+    ) -> dict[str, Any]:
+        routed_symbol = normalize_crypto_option_underlying(symbol)
+        params = {
+            "symbol": routed_symbol,
+            "requested_symbol": symbol,
+            "expiration": expiration,
+            "type": option_type,
+            "strike": strike,
+            "min_dte": min_dte,
+            "max_dte": max_dte,
+            "snapshot_mode": snapshot_mode,
+            "snapshot_date": snapshot_date,
+            "provider": provider,
+            "extra_params": extra_params or {},
+            "underlying_price": underlying_price,
+            "risk_free_rate": risk_free_rate,
+            "dividend_yield": dividend_yield,
+            "iv_history_len": len(iv_history) if isinstance(iv_history, list) else 0,
+            "price_history_len": len(price_history) if isinstance(price_history, list) else 0,
+            "hv_lookback_days": hv_lookback_days,
+            "analytics_version": "options_analytics_v1",
+        }
+        if not force:
+            hit = self.cache.get("futures_option_chain_analytics", params, ttl_seconds=self.ttl_seconds)
+            if isinstance(hit, dict):
+                return hit
+
+        payload = self.get_futures_option_chain(
+            symbol=routed_symbol,
+            expiration=expiration,
+            option_type=option_type,
+            strike=strike,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            snapshot_mode=snapshot_mode,
+            snapshot_date=snapshot_date,
+            provider=provider,
+            force=force,
+            extra_params=extra_params,
+        )
+        rows = payload.get("data", [])
+        analytics = compute_chain_analytics(
+            rows if isinstance(rows, list) else [],
+            underlying_price=underlying_price,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            snapshot_date=snapshot_date or str(payload.get("meta", {}).get("snapshot_date") or ""),
+            price_history=price_history if isinstance(price_history, list) else [],
+            iv_history=iv_history if isinstance(iv_history, list) else None,
+            hv_lookback_days=hv_lookback_days,
+        )
+
+        result = {
+            "meta": {
+                **(payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}),
+                "analytics_version": "options_analytics_v1",
+            },
+            "data": rows if isinstance(rows, list) else [],
+            "raw": payload.get("raw", {}) if isinstance(payload.get("raw"), dict) else {},
+            "analytics": analytics,
+        }
+        self.cache.set("futures_option_chain_analytics", params, result)
+        return result
