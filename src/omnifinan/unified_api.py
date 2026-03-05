@@ -69,11 +69,33 @@ def normalize_ticker(ticker: str) -> str:
     if is_crypto_ticker(ticker):
         return normalize_crypto_ticker(ticker)
 
+    raw = ticker.strip().upper()
+
+    # Index/option-underlying aliases (canonicalize to Yahoo-style caret indices).
+    index_alias_map = {
+        "SPX": "^SPX",
+        ".SPX": "^SPX",
+        "SPXW": "^SPX",
+        "NDX": "^NDX",
+        ".NDX": "^NDX",
+        "NDXW": "^NDX",
+        "VIX": "^VIX",
+        ".VIX": "^VIX",
+        "VVIX": "^VVIX",
+        ".VVIX": "^VVIX",
+    }
+    if raw in index_alias_map:
+        return index_alias_map[raw]
+
+    # Strip a leading dot for generic dot-prefixed symbols.
+    if raw.startswith(".") and len(raw) > 1:
+        raw = raw[1:]
+
     # Remove common exchange suffixes
     ticker = re.sub(
         r"\.(US|SH|SZ|HK|O|N|L|DE|PA|AS|MI|VX|SW|CO|HE|ST|OL|IC|KS|KQ|TWO|TW|BK|CR|SA|TL|JK|NZ|AX|IS|TO|NE|BR|VI)$",
         "",
-        ticker.upper(),
+        raw,
         flags=re.IGNORECASE,
     )
     # For HK stocks, ensure leading zeros for 5 digits if purely numeric
@@ -147,6 +169,11 @@ def detect_market(normalized_ticker: str) -> MarketType:
         elif normalized_ticker.startswith(("4", "8")):
             logger.debug(f"Detected Market: CHINA (BJ) for {normalized_ticker}")
             return MarketType.CHINA_BJ
+
+    # US indices in Yahoo caret form.
+    if normalized_ticker.startswith("^") and re.fullmatch(r"^\^[A-Z0-9]{1,10}$", normalized_ticker):
+        logger.debug(f"Detected Market: US (index) for {normalized_ticker}")
+        return MarketType.US
 
     # US stocks: 1-5 letters, possibly with .A/.B suffix
     if re.fullmatch(r"^[A-Z]{1,5}(\.(A|B))?$", normalized_ticker):
@@ -397,7 +424,7 @@ def _normalize_macro_series(
     return payload
 
 
-MACRO_SOURCE_POLICY_VERSION = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"
+MACRO_SOURCE_POLICY_VERSION = "fixed_sources_v2_with_dbnomics_proxies"
 
 
 def _coerce_macro_date_series(s: pd.Series) -> pd.Series:
@@ -581,6 +608,70 @@ def _fred_fetch_series(
         return _macro_error_payload(series_name, source, str(exc))
 
 
+def _yfinance_fetch_series(
+    *,
+    series_name: str,
+    ticker: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Fetch a daily close series from Yahoo Finance and normalize to macro series payload.
+
+    This is intended for market-price series (FX/futures/indices) where FRED may have
+    publication lags.
+    """
+
+    source = f"yfinance:{ticker}"
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        return _macro_error_payload(series_name, source, f"yfinance import failed: {exc}")
+
+    try:
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as exc:
+        return _macro_error_payload(series_name, source, f"yfinance download failed: {exc}")
+
+    if df is None or df.empty:
+        return _macro_error_payload(series_name, source, "empty yfinance response")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[0]) if isinstance(c, tuple) and c else str(c) for c in df.columns]
+
+    if "Close" not in df.columns:
+        return _macro_error_payload(series_name, source, "yfinance missing Close column")
+
+    work = df[["Close"]].copy()
+    work = work.rename(columns={"Close": "value"})
+    work = work.reset_index().rename(columns={"Date": "date", "Datetime": "date"})
+
+    if "date" not in work.columns:
+        return _macro_error_payload(series_name, source, "yfinance missing date column")
+
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["value"] = pd.to_numeric(work["value"], errors="coerce")
+    work = work.dropna(subset=["date", "value"]).sort_values("date")
+    work["date"] = work["date"].dt.strftime("%Y-%m-%d")
+
+    return _normalize_macro_series(
+        work[["date", "value"]],
+        series_name=series_name,
+        source=source,
+        start_date=start_date,
+        end_date=end_date,
+        date_col="date",
+        value_col="value",
+    )
+
+
 def _world_bank_fetch_series(
     *,
     series_name: str,
@@ -672,6 +763,77 @@ def _imf_fetch_series(
         return _macro_error_payload(series_name, source, str(exc))
 
 
+def _dbnomics_fetch_series(
+    *,
+    series_name: str,
+    provider_code: str,
+    dataset_code: str,
+    series_code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Fetch one DBnomics series and normalize to macro payload.
+
+    DBnomics API returns `period`/`value` vectors (not an `observations` list) for many providers.
+    We convert period strings to YYYY-MM-DD with best-effort rules.
+    """
+
+    source = f"dbnomics:{provider_code}/{dataset_code}/{series_code}"
+    try:
+        url = f"https://api.db.nomics.world/v22/series/{provider_code}/{dataset_code}/{series_code}"
+        resp = requests.get(url, params={"observations": "true", "metadata": "false"}, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        docs = payload.get("series", {}).get("docs", [])
+        if not docs:
+            return _macro_error_payload(series_name, source, "empty DBnomics response")
+        doc = docs[0]
+        periods = doc.get("period", [])
+        values = doc.get("value", [])
+        if not isinstance(periods, list) or not isinstance(values, list) or len(periods) != len(values):
+            return _macro_error_payload(series_name, source, "invalid DBnomics period/value vectors")
+
+        parsed: list[dict[str, Any]] = []
+        for p, v in zip(periods, values):
+            if v in (None, "", "NA"):
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+
+            ps = str(p)
+            if len(ps) == 4 and ps.isdigit():
+                ds = f"{ps}-12-31"
+            elif len(ps) == 7 and ps[4] == "-":
+                ds = f"{ps}-01"
+            else:
+                ds = ps
+            parsed.append({"date": ds, "value": fv})
+
+        df = pd.DataFrame(parsed)
+        if df.empty:
+            return _macro_error_payload(series_name, source, "empty DBnomics series")
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["date", "value"]).sort_values("date")
+        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+
+        return _normalize_macro_series(
+            df[["date", "value"]],
+            series_name=series_name,
+            source=source,
+            start_date=start_date,
+            end_date=end_date,
+            date_col="date",
+            value_col="value",
+        )
+    except Exception as exc:
+        logger.warning("DBnomics fetch failed for %s: %s", series_name, exc)
+        return _macro_error_payload(series_name, source, str(exc))
+
+
 def _akshare_fetch_series(
     *,
     series_name: str,
@@ -723,6 +885,40 @@ def _payload_has_observations(payload: dict[str, Any] | None) -> bool:
         return False
     obs = payload.get("observations", [])
     return isinstance(obs, list) and len(obs) > 0 and payload.get("error") is None
+
+
+def _fixed_unavailable_payload(series_name: str, *, reason: str) -> dict[str, Any]:
+    return _macro_error_payload(
+        series_name,
+        "fixed_sources_unavailable",
+        f"unavailable in current fixed providers: {reason}",
+    )
+
+
+def _disable_if_ancient(
+    payload: dict[str, Any] | None,
+    *,
+    series_name: str,
+    max_age_days: int,
+) -> dict[str, Any]:
+    """Guardrail: if upstream delivers very stale data, mark series as fixed-unavailable.
+
+    This prevents endless 'stale -> refresh' loops caused by broken upstream providers.
+    """
+
+    dt = _payload_latest_date(payload)
+    if dt is None:
+        return payload if isinstance(payload, dict) else _fixed_unavailable_payload(series_name, reason="missing latest_date")
+    age_days = (date.today() - dt).days
+    if age_days > max_age_days:
+        logger.error(
+            "Macro series %s upstream appears stale (age_days=%d > %d); marking fixed-unavailable.",
+            series_name,
+            age_days,
+            max_age_days,
+        )
+        return _fixed_unavailable_payload(series_name, reason=f"upstream stale (latest_date={dt.isoformat()})")
+    return payload if isinstance(payload, dict) else _fixed_unavailable_payload(series_name, reason="invalid payload")
 
 
 def _first_non_empty_payload(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1179,14 +1375,12 @@ def get_macro_indicators(
             value_col="今值",
         )
     if _want("us_consumer_sentiment_michigan"):
-        results["series"]["us_consumer_sentiment_michigan"] = _akshare_fetch_series(
+        # Prefer FRED for timeliness/stability (AkShare feed can lag).
+        results["series"]["us_consumer_sentiment_michigan"] = _fred_fetch_series(
             series_name="us_consumer_sentiment_michigan",
-            fetcher_name="macro_usa_michigan_consumer_sentiment",
-            source="akshare:us_macro:macro_usa_michigan_consumer_sentiment",
+            series_id="UMCSENT",
             start_date=start_date,
             end_date=end_date,
-            date_col="日期",
-            value_col="今值",
         )
     if _want("us_industrial_production"):
         results["series"]["us_industrial_production"] = _fred_fetch_series(
@@ -1337,16 +1531,18 @@ def get_macro_indicators(
         end_date=end_date,
     )
     if _want("us_dollar_index_broad"):
-        results["series"]["us_dollar_index_broad"] = _fred_fetch_series(
+        # Prefer market-price source over FRED to avoid publication lag.
+        results["series"]["us_dollar_index_broad"] = _yfinance_fetch_series(
         series_name="us_dollar_index_broad",
-        series_id="DTWEXBGS",
+        ticker="DX-Y.NYB",
         start_date=start_date,
         end_date=end_date,
     )
     if _want("commodity_wti_crude"):
-        results["series"]["commodity_wti_crude"] = _fred_fetch_series(
+        # Prefer futures market price over FRED spot series to avoid publication lag/gaps.
+        results["series"]["commodity_wti_crude"] = _yfinance_fetch_series(
         series_name="commodity_wti_crude",
-        series_id="DCOILWTICO",
+        ticker="CL=F",
         start_date=start_date,
         end_date=end_date,
     )
@@ -1469,9 +1665,9 @@ def get_macro_indicators(
         end_date=end_date,
     )
     if _want("sg_usd_fx"):
-        results["series"]["sg_usd_fx"] = _fred_fetch_series(
+        results["series"]["sg_usd_fx"] = _yfinance_fetch_series(
         series_name="sg_usd_fx",
-        series_id="DEXSIUS",
+        ticker="SGD=X",
         start_date=start_date,
         end_date=end_date,
     )
@@ -1517,9 +1713,9 @@ def get_macro_indicators(
         end_date=end_date,
     )
     if _want("jp_usd_fx"):
-        results["series"]["jp_usd_fx"] = _fred_fetch_series(
+        results["series"]["jp_usd_fx"] = _yfinance_fetch_series(
         series_name="jp_usd_fx",
-        series_id="DEXJPUS",
+        ticker="JPY=X",
         start_date=start_date,
         end_date=end_date,
     )
@@ -1538,21 +1734,21 @@ def get_macro_indicators(
         end_date=end_date,
     )
     if _want("eu_usd_fx"):
-        results["series"]["eu_usd_fx"] = _fred_fetch_series(
+        results["series"]["eu_usd_fx"] = _yfinance_fetch_series(
         series_name="eu_usd_fx",
-        series_id="DEXUSEU",
+        ticker="EURUSD=X",
         start_date=start_date,
         end_date=end_date,
     )
-    if _want("eu_pmi_manufacturing"):
-        results["series"]["eu_pmi_manufacturing"] = _akshare_fetch_series(
-            series_name="eu_pmi_manufacturing",
-            fetcher_name="macro_euro_manufacturing_pmi",
-            source="akshare:eu_macro:macro_euro_manufacturing_pmi",
+    if _want("eu_industrial_confidence_indicator"):
+        # Canonical replacement for (previous) euro-area manufacturing PMI feed.
+        results["series"]["eu_industrial_confidence_indicator"] = _dbnomics_fetch_series(
+            series_name="eu_industrial_confidence_indicator",
+            provider_code="Eurostat",
+            dataset_code="EI_BSSI_M_R2",
+            series_code="M.BS-ICI-BAL.SA.EA20",
             start_date=start_date,
             end_date=end_date,
-            date_col="日期",
-            value_col="今值",
         )
     if _want("jp_policy_rate"):
         results["series"]["jp_policy_rate"] = _akshare_fetch_series(
@@ -1632,11 +1828,12 @@ def get_macro_indicators(
     # China: AkShare wrappers for official China data sources (fixed)
     china_specs = [
         {
+            # AkShare benchmark-rate series is often stale; use LPR 1Y as the operational policy proxy.
             "key": "pboc_policy_rate",
-            "fetcher_name": "macro_bank_china_interest_rate",
-            "source": "akshare:china_official:pboc",
-            "date_col": "日期",
-            "value_col": "今值",
+            "fetcher_name": "macro_china_lpr",
+            "source": "alias:akshare:china_official:pboc:lpr1y",
+            "date_col": "TRADE_DATE",
+            "value_col": "LPR1Y",
         },
         {
             "key": "china_lpr_1y",
@@ -1657,19 +1854,17 @@ def get_macro_indicators(
         {"key": "china_ppi_yoy", "fetcher_name": "macro_china_ppi_yearly", "source": "akshare:china_official:nbs"},
         {"key": "china_gdp_yoy", "fetcher_name": "macro_china_gdp_yearly", "source": "akshare:china_official:nbs"},
         {"key": "china_pmi_manufacturing", "fetcher_name": "macro_china_pmi_yearly", "source": "akshare:china_official:nbs"},
+        # Canonical replacements for Caixin PMI feeds.
+        # Use NBS PMI series via DBnomics.
         {
-            "key": "china_caixin_pmi_manufacturing",
-            "fetcher_name": "macro_china_cx_pmi_yearly",
-            "source": "akshare:china_official:caixin",
-            "date_col": "日期",
-            "value_col": "今值",
+            "key": "china_pmi_manufacturing_nbs",
+            "fetcher_name": "__dbnomics__NBS_M_A0B01_A0B0101",
+            "source": "dbnomics:NBS/M_A0B01/A0B0101",
         },
         {
-            "key": "china_caixin_pmi_services",
-            "fetcher_name": "macro_china_cx_services_pmi_yearly",
-            "source": "akshare:china_official:caixin",
-            "date_col": "日期",
-            "value_col": "今值",
+            "key": "china_pmi_services_nbs",
+            "fetcher_name": "__dbnomics__NBS_M_A0B02_A0B020C",
+            "source": "dbnomics:NBS/M_A0B02/A0B020C",
         },
         {"key": "china_pmi_non_manufacturing", "fetcher_name": "macro_china_non_man_pmi", "source": "akshare:china_official:nbs"},
         {
@@ -1679,7 +1874,7 @@ def get_macro_indicators(
             "date_col": "date",
             "value_col": "value",
         },
-        {"key": "china_m2_yoy", "fetcher_name": "macro_china_m2_yearly", "source": "akshare:china_official:pboc"},
+        {"key": "china_m2_yoy_nbs", "fetcher_name": "__dbnomics__NBS_M_A0D01_A0D0102", "source": "dbnomics:NBS/M_A0D01/A0D0102"},
         {
             "key": "china_social_financing",
             "fetcher_name": "macro_china_shrzgm",
@@ -1715,20 +1910,87 @@ def get_macro_indicators(
         {"key": "china_exports_yoy", "fetcher_name": "macro_china_exports_yoy", "source": "akshare:china_official:customs"},
         {"key": "china_imports_yoy", "fetcher_name": "macro_china_imports_yoy", "source": "akshare:china_official:customs"},
         {"key": "china_trade_balance", "fetcher_name": "macro_china_trade_balance", "source": "akshare:china_official:customs"},
-        {"key": "china_fx_reserves", "fetcher_name": "macro_china_fx_reserves_yearly", "source": "akshare:china_official:safe"},
+        {"key": "china_fx_reserves_usd_imf", "fetcher_name": "__dbnomics__IMF_IFS_RAXGFX_USD", "source": "dbnomics:IMF/IFS:RAXGFX_USD:CN"},
     ]
     for spec in china_specs:
         if not _want(str(spec["key"])):
             continue
-        results["series"][spec["key"]] = _akshare_fetch_series(
-            series_name=str(spec["key"]),
-            fetcher_name=str(spec["fetcher_name"]),
-            source=str(spec["source"]),
-            start_date=start_date,
-            end_date=end_date,
-            date_col=spec.get("date_col"),
-            value_col=spec.get("value_col"),
-        )
+        fetcher_name = str(spec.get("fetcher_name", ""))
+        if fetcher_name.startswith("__dbnomics__"):
+            # Hard-coded canonical DBnomics mappings (see AGENTS.md register).
+            if fetcher_name == "__dbnomics__NBS_M_A0B01_A0B0101":
+                results["series"][spec["key"]] = _dbnomics_fetch_series(
+                    series_name=str(spec["key"]),
+                    provider_code="NBS",
+                    dataset_code="M_A0B01",
+                    series_code="A0B0101",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            elif fetcher_name == "__dbnomics__NBS_M_A0B02_A0B020C":
+                results["series"][spec["key"]] = _dbnomics_fetch_series(
+                    series_name=str(spec["key"]),
+                    provider_code="NBS",
+                    dataset_code="M_A0B02",
+                    series_code="A0B020C",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            elif fetcher_name == "__dbnomics__NBS_M_A0D01_A0D0102":
+                results["series"][spec["key"]] = _dbnomics_fetch_series(
+                    series_name=str(spec["key"]),
+                    provider_code="NBS",
+                    dataset_code="M_A0D01",
+                    series_code="A0D0102",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            elif fetcher_name == "__dbnomics__IMF_IFS_RAXGFX_USD":
+                # IMF/IFS reserves proxy uses dimensions; fall back to DBnomics Python client.
+                try:
+                    import dbnomics  # type: ignore
+
+                    df = dbnomics.fetch_series(
+                        "IMF",
+                        "IFS",
+                        dimensions={"REF_AREA": ["CN"], "INDICATOR": ["RAXGFX_USD"]},
+                        max_nb_series=5,
+                    )
+                    df = df[["period", "value"]].rename(columns={"period": "date"}).copy()
+                    df["date"] = df["date"].astype(str)
+                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                    df = df.dropna(subset=["date", "value"])
+                    results["series"][spec["key"]] = _normalize_macro_series(
+                        df,
+                        series_name=str(spec["key"]),
+                        source=str(spec["source"]),
+                        start_date=start_date,
+                        end_date=end_date,
+                        date_col="date",
+                        value_col="value",
+                    )
+                except Exception as exc:
+                    results["series"][spec["key"]] = _macro_error_payload(
+                        str(spec["key"]),
+                        str(spec["source"]),
+                        f"dbnomics fetch failed: {exc}",
+                    )
+            else:
+                results["series"][spec["key"]] = _macro_error_payload(
+                    str(spec["key"]),
+                    str(spec["source"]),
+                    f"dbnomics mapping not implemented: {fetcher_name}",
+                )
+        else:
+            results["series"][spec["key"]] = _akshare_fetch_series(
+                series_name=str(spec["key"]),
+                fetcher_name=fetcher_name,
+                source=str(spec["source"]),
+                start_date=start_date,
+                end_date=end_date,
+                date_col=spec.get("date_col"),
+                value_col=spec.get("value_col"),
+            )
 
     # PBOC policy rate fallback: if benchmark-rate series is stale, use LPR 1Y as operational policy proxy.
     if _want("pboc_policy_rate") and _want("china_lpr_1y"):
@@ -1770,8 +2032,8 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "us_non_farm_payrolls": "growth",
     "china_gdp_yoy": "growth",
     "china_pmi_manufacturing": "growth",
-    "china_caixin_pmi_manufacturing": "growth",
-    "china_caixin_pmi_services": "growth",
+    "china_pmi_manufacturing_nbs": "growth",
+    "china_pmi_services_nbs": "growth",
     "china_pmi_non_manufacturing": "growth",
     "china_industrial_production_yoy": "growth",
     "china_retail_sales_yoy": "growth",
@@ -1799,7 +2061,8 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "pboc_policy_rate": "liquidity",
     "sofr": "liquidity",
     "us_m2": "liquidity",
-    "china_m2_yoy": "liquidity",
+    "china_m2_yoy_nbs": "liquidity",
+    "china_fx_reserves_usd_imf": "liquidity",
     "sg_broad_money_growth": "liquidity",
     "us_central_bank_total_assets": "liquidity",
     "china_central_bank_balance_sheet": "liquidity",
@@ -1836,7 +2099,7 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "sg_usd_fx": "market_feedback",
     "jp_usd_fx": "market_feedback",
     "eu_usd_fx": "market_feedback",
-    "eu_pmi_manufacturing": "growth",
+    "eu_industrial_confidence_indicator": "growth",
 }
 
 
@@ -2520,46 +2783,61 @@ def get_stock_option_chain(
     max_dte: int | None = None,
     snapshot_mode: Literal["prev_close", "realtime"] = "prev_close",
     snapshot_date: str | None = None,
-    provider: Literal["auto", "marketdata", "yfinance"] = "auto",
+    provider: Literal["auto", "moomoo", "marketdata", "yahooquery", "yfinance"] = "auto",
     extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fetch US stock option chain from optional providers."""
     provider_name = str(provider or "auto").strip().lower()
-    if provider_name not in {"auto", "marketdata", "yfinance"}:
-        raise ValueError("provider must be one of {'auto', 'marketdata', 'yfinance'}")
+    if provider_name in {"yfinance", "yahooquery"}:
+        # Backward-compatible aliases.
+        provider_name = "moomoo"
+    if provider_name not in {"auto", "moomoo", "marketdata"}:
+        raise ValueError("provider must be one of {'auto', 'moomoo', 'marketdata'}")
 
-    if provider_name in {"auto", "marketdata"}:
-        from .data.providers.marketdata_provider import MarketDataOptionsProvider
+    route: list[str] = ["moomoo"] if provider_name in {"auto", "moomoo"} else ["marketdata"]
 
-        try:
-            return MarketDataOptionsProvider().get_stock_option_chain(
-                symbol=symbol,
-                expiration=expiration,
-                option_type=option_type,
-                strike=strike,
-                min_dte=min_dte,
-                max_dte=max_dte,
-                snapshot_mode=snapshot_mode,
-                snapshot_date=snapshot_date,
-                extra_params=extra_params,
-            )
-        except Exception:
-            if provider_name == "marketdata":
-                raise
+    for r in route:
+        if r == "moomoo":
+            from .data.providers.moomoo_options_provider import MoomooOptionsProvider
 
-    from .data.providers.yfinance_options_provider import YFinanceOptionsProvider
+            try:
+                return MoomooOptionsProvider().get_stock_option_chain(
+                    symbol=symbol,
+                    expiration=expiration,
+                    option_type=option_type,
+                    strike=strike,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    snapshot_mode=snapshot_mode,
+                    snapshot_date=snapshot_date,
+                    extra_params=extra_params,
+                )
+            except Exception:
+                if provider_name in {"auto", "moomoo"}:
+                    raise
+                continue
 
-    return YFinanceOptionsProvider().get_stock_option_chain(
-        symbol=symbol,
-        expiration=expiration,
-        option_type=option_type,
-        strike=strike,
-        min_dte=min_dte,
-        max_dte=max_dte,
-        snapshot_mode=snapshot_mode,
-        snapshot_date=snapshot_date,
-        extra_params=extra_params,
-    )
+        if r == "marketdata":
+            from .data.providers.marketdata_provider import MarketDataOptionsProvider
+
+            try:
+                return MarketDataOptionsProvider().get_stock_option_chain(
+                    symbol=symbol,
+                    expiration=expiration,
+                    option_type=option_type,
+                    strike=strike,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    snapshot_mode=snapshot_mode,
+                    snapshot_date=snapshot_date,
+                    extra_params=extra_params,
+                )
+            except Exception:
+                if provider_name == "marketdata":
+                    raise
+                continue
+
+    raise RuntimeError("failed to fetch stock option chain from all routed providers")
 
 
 def get_futures_option_chain(

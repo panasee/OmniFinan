@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import date, datetime, timedelta
 from statistics import median
@@ -13,6 +14,7 @@ from ..analysis.options import compute_chain_analytics
 from .cache import DataCache
 from .providers.base import DataProvider
 from .providers.marketdata_provider import MarketDataOptionsProvider
+from .providers.moomoo_options_provider import MoomooOptionsProvider
 from .providers.yfinance_options_provider import YFinanceOptionsProvider
 from .providers.yfinance_provider import YFinanceProvider
 from .symbols import (
@@ -31,6 +33,7 @@ class UnifiedDataService:
         self.ttl_seconds = ttl_seconds
         self._crypto_provider: DataProvider | None = None
         self._options_provider: MarketDataOptionsProvider | None = None
+        self._moomoo_options_provider: MoomooOptionsProvider | None = None
         self._yf_options_provider: YFinanceOptionsProvider | None = None
         self.cache.cleanup_expired(ttl_seconds)
 
@@ -43,6 +46,11 @@ class UnifiedDataService:
         if self._options_provider is None:
             self._options_provider = MarketDataOptionsProvider()
         return self._options_provider
+
+    def _get_moomoo_options_provider(self) -> MoomooOptionsProvider:
+        if self._moomoo_options_provider is None:
+            self._moomoo_options_provider = MoomooOptionsProvider()
+        return self._moomoo_options_provider
 
     def _get_yf_options_provider(self) -> YFinanceOptionsProvider:
         if self._yf_options_provider is None:
@@ -117,6 +125,55 @@ class UnifiedDataService:
                 except ValueError:
                     continue
         return None
+
+    def _infer_contract_multiplier(self, symbol: str, contract_multiplier: float | None) -> float:
+        if contract_multiplier is not None and contract_multiplier > 0:
+            return float(contract_multiplier)
+        s = str(symbol or "").strip().upper()
+        if s in {".SPX", "SPX", "^SPX", "SPXW", ".NDX", "NDX", "^NDX", "NDXW"}:
+            return 100.0
+        return 100.0
+
+    def _extract_latest_value(self, payload: dict[str, Any] | None, key: str) -> float | None:
+        if not isinstance(payload, dict):
+            return None
+        series = payload.get("series", {}) if isinstance(payload.get("series"), dict) else {}
+        item = series.get(key)
+        if not isinstance(item, dict):
+            return None
+        latest = item.get("latest")
+        if isinstance(latest, dict):
+            val = latest.get("value")
+            try:
+                return float(val) if val is not None else None
+            except Exception:
+                return None
+        obs = item.get("observations")
+        if isinstance(obs, list) and obs:
+            val = obs[-1].get("value") if isinstance(obs[-1], dict) else None
+            try:
+                return float(val) if val is not None else None
+            except Exception:
+                return None
+        return None
+
+    def _resolve_risk_free_rate(self, requested_rate: float | None) -> tuple[float, str]:
+        if requested_rate is not None:
+            return float(requested_rate), "input"
+
+        try:
+            macro = self.get_macro_indicators(force=False)
+        except Exception:
+            macro = None
+
+        for key in ("us_treasury_2y", "us_treasury_10y"):
+            val = self._extract_latest_value(macro, key)
+            if val is not None:
+                # Macro yields are usually in percent.
+                rate = val / 100.0 if val > 1 else val
+                return float(rate), f"macro:{key}"
+
+        return 0.02, "fallback_default"
 
     def _interval_to_timedelta(self, interval: str) -> timedelta:
         text = str(interval or "1d").strip().lower()
@@ -787,15 +844,27 @@ class UnifiedDataService:
                             else:
                                 logger.info("Macro missing-series refresh had no data delta.")
                             return self._filter_macro_payload_window(payload, start_date, end_date)
-                    except Exception:
-                        logger.exception("Macro subset refresh failed; fallback to full refresh.")
-                logger.info(
-                    "Macro master cache has stale series and subset refresh unavailable; forcing full refresh. "
-                    "stale=%d window=%s~%s",
+                    except Exception as exc:
+                        logger.error(
+                            "Macro subset refresh failed (force=False). Using cached payload. error=%s",
+                            str(exc),
+                        )
+                        return self._filter_macro_payload_window(payload, start_date, end_date)
+                logger.error(
+                    "Macro subset refresh unavailable but stale series detected (force=False). "
+                    "Using cached payload. stale=%d window=%s~%s",
                     len(stale_keys),
                     start_date,
                     end_date,
                 )
+                # Critical behavior: never auto full-refresh unless explicitly forced.
+                # Full refresh can be dominated by slow providers (e.g., AkShare), and should be
+                # a user-initiated operation.
+                logger.error(
+                    "Macro refresh degraded: provider lacks subset refresh; run with force=True to full refresh "+
+                    "(may be slow) or implement get_macro_indicators_subset()."
+                )
+                return self._filter_macro_payload_window(payload, start_date, end_date)
 
         try:
             # Always refresh the master database using full available history; query windows are subsets.
@@ -1000,38 +1069,57 @@ class UnifiedDataService:
                 return hit
 
         p = str(provider or "auto").strip().lower()
-        if p not in {"auto", "marketdata", "yfinance"}:
-            raise ValueError("provider must be one of {'auto', 'marketdata', 'yfinance'}")
+        if p in {"yfinance", "yahooquery"}:
+            # Backward-compatible aliases.
+            p = "moomoo"
+        if p not in {"auto", "moomoo", "marketdata"}:
+            raise ValueError("provider must be one of {'auto', 'moomoo', 'marketdata'}")
+
+        # User decision: stock options default to moomoo without fallback.
+        route = ["moomoo"] if p in {"auto", "moomoo"} else ["marketdata"]
 
         payload: dict[str, Any] | None = None
-        if p in {"auto", "marketdata"}:
-            try:
-                payload = self._get_options_provider().get_stock_option_chain(
-                    symbol=routed_symbol,
-                    expiration=expiration,
-                    option_type=option_type,
-                    strike=strike,
-                    min_dte=min_dte,
-                    max_dte=max_dte,
-                    snapshot_mode=snapshot_mode,
-                    snapshot_date=snapshot_date,
-                    extra_params=extra_params,
-                )
-            except Exception:
-                if p == "marketdata":
-                    raise
+        for r in route:
+            if r == "moomoo":
+                try:
+                    payload = self._get_moomoo_options_provider().get_stock_option_chain(
+                        symbol=routed_symbol,
+                        expiration=expiration,
+                        option_type=option_type,
+                        strike=strike,
+                        min_dte=min_dte,
+                        max_dte=max_dte,
+                        snapshot_mode=snapshot_mode,
+                        snapshot_date=snapshot_date,
+                        extra_params=extra_params,
+                    )
+                    break
+                except Exception:
+                    if p == "moomoo" or p == "auto":
+                        raise
+                    continue
+
+            if r == "marketdata":
+                try:
+                    payload = self._get_options_provider().get_stock_option_chain(
+                        symbol=routed_symbol,
+                        expiration=expiration,
+                        option_type=option_type,
+                        strike=strike,
+                        min_dte=min_dte,
+                        max_dte=max_dte,
+                        snapshot_mode=snapshot_mode,
+                        snapshot_date=snapshot_date,
+                        extra_params=extra_params,
+                    )
+                    break
+                except Exception:
+                    if p == "marketdata":
+                        raise
+                    continue
+
         if payload is None:
-            payload = self._get_yf_options_provider().get_stock_option_chain(
-                symbol=routed_symbol,
-                expiration=expiration,
-                option_type=option_type,
-                strike=strike,
-                min_dte=min_dte,
-                max_dte=max_dte,
-                snapshot_mode=snapshot_mode,
-                snapshot_date=snapshot_date,
-                extra_params=extra_params,
-            )
+            raise RuntimeError("failed to fetch stock option chain from all routed providers")
         self.cache.set("stock_option_chain", params, payload)
         return payload
 
@@ -1098,12 +1186,13 @@ class UnifiedDataService:
         force: bool = False,
         extra_params: dict[str, Any] | None = None,
         underlying_price: float | None = None,
-        risk_free_rate: float = 0.02,
+        risk_free_rate: float | None = None,
         dividend_yield: float = 0.0,
         iv_history: list[float] | None = None,
         price_history: list[dict[str, Any]] | None = None,
         include_realized_vol: bool = True,
         hv_lookback_days: int = 20,
+        contract_multiplier: float | None = None,
     ) -> dict[str, Any]:
         if is_non_option_equity_market_ticker(symbol):
             payload = self._unsupported_stock_option_payload(
@@ -1148,6 +1237,7 @@ class UnifiedDataService:
             "underlying_price": underlying_price,
             "risk_free_rate": risk_free_rate,
             "dividend_yield": dividend_yield,
+            "contract_multiplier": contract_multiplier,
             "iv_history_len": len(iv_history) if isinstance(iv_history, list) else 0,
             "price_history_len": len(price_history) if isinstance(price_history, list) else 0,
             "include_realized_vol": include_realized_vol,
@@ -1189,21 +1279,31 @@ class UnifiedDataService:
                 )
             except Exception:
                 hv_prices = []
+        resolved_risk_free_rate, risk_free_rate_source = self._resolve_risk_free_rate(risk_free_rate)
+        resolved_contract_multiplier = self._infer_contract_multiplier(symbol, contract_multiplier)
+        resolved_underlying_price = underlying_price
+        if resolved_underlying_price is None and isinstance(payload.get("meta"), dict):
+            resolved_underlying_price = payload.get("meta", {}).get("underlying_price")
+
         analytics = compute_chain_analytics(
             rows if isinstance(rows, list) else [],
-            underlying_price=underlying_price,
-            risk_free_rate=risk_free_rate,
+            underlying_price=resolved_underlying_price,
+            risk_free_rate=resolved_risk_free_rate,
             dividend_yield=dividend_yield,
             snapshot_date=resolved_snapshot,
             price_history=hv_prices if isinstance(hv_prices, list) else [],
             iv_history=iv_history if isinstance(iv_history, list) else None,
             hv_lookback_days=hv_lookback_days,
+            contract_multiplier=resolved_contract_multiplier,
         )
 
         result = {
             "meta": {
                 **(payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}),
                 "analytics_version": "options_analytics_v1",
+                "risk_free_rate": resolved_risk_free_rate,
+                "risk_free_rate_source": risk_free_rate_source,
+                "contract_multiplier": resolved_contract_multiplier,
             },
             "data": rows if isinstance(rows, list) else [],
             "raw": payload.get("raw", {}) if isinstance(payload.get("raw"), dict) else {},
@@ -1211,6 +1311,395 @@ class UnifiedDataService:
         }
         self.cache.set("stock_option_chain_analytics", params, result)
         return result
+
+    def get_stock_option_gex(
+        self,
+        symbol: str,
+        expiration: str | None = None,
+        gex_expiration: str | None = None,
+        option_type: str | None = None,
+        strike: float | None = None,
+        min_dte: int | None = None,
+        max_dte: int | None = None,
+        snapshot_mode: str = "prev_close",
+        snapshot_date: str | None = None,
+        provider: str = "auto",
+        force: bool = False,
+        extra_params: dict[str, Any] | None = None,
+        underlying_price: float | None = None,
+        risk_free_rate: float | None = None,
+        dividend_yield: float = 0.0,
+        iv_history: list[float] | None = None,
+        price_history: list[dict[str, Any]] | None = None,
+        include_realized_vol: bool = True,
+        hv_lookback_days: int = 20,
+        contract_multiplier: float | None = None,
+    ) -> dict[str, Any]:
+        """Return estimated GEX summary for a stock/index option chain.
+
+        GEX is estimated from Black-Scholes gamma and chain open interest.
+        """
+        resolved_expiration = gex_expiration if gex_expiration is not None else expiration
+
+        analytics_payload = self.get_stock_option_chain_analytics(
+            symbol=symbol,
+            expiration=resolved_expiration,
+            option_type=option_type,
+            strike=strike,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            snapshot_mode=snapshot_mode,
+            snapshot_date=snapshot_date,
+            provider=provider,
+            force=force,
+            extra_params=extra_params,
+            underlying_price=underlying_price,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            iv_history=iv_history,
+            price_history=price_history,
+            include_realized_vol=include_realized_vol,
+            hv_lookback_days=hv_lookback_days,
+            contract_multiplier=contract_multiplier,
+        )
+        summary = (((analytics_payload.get("analytics") or {}).get("summary")) or {})
+        meta = analytics_payload.get("meta") or {}
+        rows = analytics_payload.get("data") if isinstance(analytics_payload.get("data"), list) else []
+
+        spot = float(summary.get("underlying_price") or 0.0)
+        rows_total = int(summary.get("option_count") or len(rows) or 0)
+        rows_usable = int(summary.get("enriched_count") or 0)
+        quality = float(rows_usable / rows_total) if rows_total > 0 else 0.0
+        contract_mult = float(summary.get("contract_multiplier") or meta.get("contract_multiplier") or 100.0)
+        risk_free = float(summary.get("risk_free_rate") or meta.get("risk_free_rate") or 0.02)
+
+        # Build strike profile + term buckets from raw chain rows.
+        def _norm_pdf(x: float) -> float:
+            return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+        now_ts = datetime.utcnow().timestamp()
+        sec_per_year = 365.0 * 24.0 * 3600.0
+        net_by_strike: dict[float, float] = {}
+        bucket_net = {"zero_dte": 0.0, "near_term_1w": 0.0, "long_term": 0.0}
+        total_volume = 0.0
+        total_abs_gex = 0.0
+        total_vanna_exp = 0.0
+        total_charm_exp = 0.0
+        vanna_call_exp = 0.0
+        vanna_put_exp = 0.0
+        charm_call_exp = 0.0
+        charm_put_exp = 0.0
+        gex_inputs: list[tuple[float, float, float, float, float]] = []
+
+        for r in rows:
+            try:
+                k = float(r.get("strike")) if r.get("strike") is not None else None
+                iv = float(r.get("iv")) if r.get("iv") is not None else None
+                oi = float(r.get("openInterest")) if r.get("openInterest") is not None else None
+                exp = float(r.get("expiration")) if r.get("expiration") is not None else None
+                side = str(r.get("side") or "").lower()
+                vol = float(r.get("volume")) if r.get("volume") is not None else None
+            except Exception:
+                continue
+            if vol is not None and vol >= 0:
+                total_volume += vol
+            if None in (k, iv, oi, exp) or k <= 0 or iv <= 0 or oi < 0 or spot <= 0:
+                continue
+            t = max((exp - now_ts) / sec_per_year, 1.0 / 365.0)
+            d1 = (math.log(spot / k) + (risk_free + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
+            d2 = d1 - iv * math.sqrt(t)
+            pdf_d1 = _norm_pdf(d1)
+            gamma = pdf_d1 / (spot * iv * math.sqrt(t))
+            sign = 1.0 if side == "call" else -1.0
+            gex = sign * gamma * oi * contract_mult * (spot**2) * 0.01
+            gex_inputs.append((k, iv, oi, exp, sign))
+
+            # Estimated vanna/charm exposures for risk-profile diagnostics.
+            vanna = pdf_d1 * (-d2 / iv)
+            vanna_exp = sign * vanna * oi * contract_mult * spot * 0.01
+
+            charm = -pdf_d1 * (risk_free / (iv * math.sqrt(t)) - d2 / (2.0 * t))
+            charm_exp = sign * charm * oi * contract_mult * spot * (1.0 / 365.0)
+
+            total_vanna_exp += vanna_exp
+            total_charm_exp += charm_exp
+            if side == "call":
+                vanna_call_exp += vanna_exp
+                charm_call_exp += charm_exp
+            else:
+                vanna_put_exp += vanna_exp
+                charm_put_exp += charm_exp
+            total_abs_gex += abs(gex)
+            net_by_strike[k] = net_by_strike.get(k, 0.0) + gex
+
+            dte = (exp - now_ts) / (24.0 * 3600.0)
+            if dte <= 1.0:
+                bucket_net["zero_dte"] += gex
+            elif dte <= 7.0:
+                bucket_net["near_term_1w"] += gex
+            else:
+                bucket_net["long_term"] += gex
+
+        strikes = sorted(net_by_strike.keys())
+
+        # Spot-sweep zero-gamma root (institutional-style): solve GEX(S') = 0 over a spot grid.
+        def _net_gex_at_spot(test_spot: float) -> float:
+            if test_spot <= 0:
+                return 0.0
+            total = 0.0
+            for k, iv, oi, exp, sign in gex_inputs:
+                t = max((exp - now_ts) / sec_per_year, 1.0 / 365.0)
+                d1 = (math.log(test_spot / k) + (risk_free + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
+                gamma = _norm_pdf(d1) / (test_spot * iv * math.sqrt(t))
+                total += sign * gamma * oi * contract_mult * (test_spot**2) * 0.01
+            return total
+
+        gamma_flip_price = None
+        if spot > 0 and gex_inputs:
+            grid_min = spot * 0.7
+            grid_max = spot * 1.3
+            steps = 121
+            grid = [grid_min + (grid_max - grid_min) * i / (steps - 1) for i in range(steps)]
+            vals = [_net_gex_at_spot(sv) for sv in grid]
+
+            for i in range(1, len(grid)):
+                x0, y0 = grid[i - 1], vals[i - 1]
+                x1, y1 = grid[i], vals[i]
+                if y0 == 0:
+                    gamma_flip_price = x0
+                    break
+                if y1 == 0:
+                    gamma_flip_price = x1
+                    break
+                if y0 * y1 < 0:
+                    gamma_flip_price = x0 + (0.0 - y0) * (x1 - x0) / (y1 - y0)
+                    break
+
+        zero_gamma_distance_pct = (
+            abs(spot - float(gamma_flip_price)) / spot * 100.0 if gamma_flip_price is not None and spot > 0 else None
+        )
+
+        call_wall = max(strikes, key=lambda x: net_by_strike.get(x, 0.0)) if strikes else None
+        put_wall = min(strikes, key=lambda x: net_by_strike.get(x, 0.0)) if strikes else None
+        max_gamma_strike = max(strikes, key=lambda x: abs(net_by_strike.get(x, 0.0))) if strikes else None
+
+        total_abs_bucket = sum(abs(v) for v in bucket_net.values())
+
+        # Gamma concentration index: top-5 absolute strike GEX share.
+        abs_vals = sorted((abs(v) for v in net_by_strike.values()), reverse=True)
+        top5_abs = sum(abs_vals[:5])
+        all_abs = sum(abs_vals)
+        concentration_index = (top5_abs / all_abs) if all_abs > 0 else None
+
+        def _pct(v: float) -> float | None:
+            return (abs(v) / total_abs_bucket * 100.0) if total_abs_bucket > 0 else None
+
+        # Sample three strikes closest to spot.
+        profile_data_sample: list[dict[str, Any]] = []
+        if strikes and spot > 0:
+            near = sorted(strikes, key=lambda x: abs(x - spot))[:3]
+            for k in sorted(near):
+                val = net_by_strike.get(k, 0.0)
+                if val > 0:
+                    bias = "call_heavy"
+                elif val < 0:
+                    bias = "put_heavy"
+                else:
+                    bias = "balanced"
+                profile_data_sample.append({"strike": float(k), "net_gex": float(val), "side_bias": bias})
+
+        # Approx OPEX-week flag: current week contains 3rd Friday.
+        today = datetime.utcnow().date()
+        first_day = today.replace(day=1)
+        weekday_first = first_day.weekday()  # Mon=0
+        first_friday = 1 + ((4 - weekday_first) % 7)
+        third_friday = first_friday + 14
+        opex_date = today.replace(day=third_friday)
+        is_opex_week = (today - timedelta(days=today.weekday())) <= opex_date <= (today + timedelta(days=6 - today.weekday()))
+
+        mean_iv = None
+        iv_vals = [float(r.get("iv")) for r in rows if r.get("iv") is not None]
+        if iv_vals:
+            mean_iv = sum(iv_vals) / len(iv_vals)
+
+        net_gex = float(summary.get("net_gex_est") or 0.0)
+        call_gex_nominal = float(summary.get("call_gex_est") or 0.0)
+        put_gex_nominal = float(summary.get("put_gex_est") or 0.0)
+        put_share = (abs(put_gex_nominal) / (abs(call_gex_nominal) + abs(put_gex_nominal))) if (abs(call_gex_nominal) + abs(put_gex_nominal)) > 0 else None
+        gamma_skew = (abs(put_gex_nominal) / abs(call_gex_nominal)) if abs(call_gex_nominal) > 0 else None
+        gamma_purity = (net_gex / total_abs_gex) if total_abs_gex > 0 else None
+        tail_risk_warning = bool((put_share is not None and put_share > 0.7) and (net_gex < 0.0))
+
+        zero_dte_pct = _pct(bucket_net["zero_dte"])
+        spot_near_flip = bool(
+            gamma_flip_price is not None
+            and spot > 0
+            and (abs(spot - float(gamma_flip_price)) / spot) <= 0.01
+        )
+
+        vanna_regime = "positive_vanna" if total_vanna_exp >= 0 else "negative_vanna"
+        charm_regime = "positive_charm" if total_charm_exp >= 0 else "negative_charm"
+        flow_interpretation = {
+            "vanna_regime": vanna_regime,
+            "charm_regime": charm_regime,
+            "tail_risk_warning": tail_risk_warning,
+            "notes": [
+                "negative_vanna often amplifies rebound sensitivity when IV compresses",
+                "positive_charm can create passive buy-to-hedge drift into expiry",
+                "negative_charm can create passive sell-to-hedge drift into expiry",
+            ],
+        }
+
+        # Underlying dollar-volume proxy (20D avg) for GEX dominance checks.
+        avg_underlying_dollar_volume_20d = None
+        gex_to_underlying_dollar_volume_ratio = None
+        try:
+            end_dt = datetime.utcnow().date()
+            start_dt = end_dt - timedelta(days=40)
+            px_rows = self.get_prices(
+                ticker=str(symbol).strip().upper(),
+                start_date=start_dt.strftime("%Y-%m-%d"),
+                end_date=end_dt.strftime("%Y-%m-%d"),
+                interval="1d",
+                force=False,
+            )
+            if isinstance(px_rows, list) and px_rows:
+                notional_series: list[float] = []
+                for pr in px_rows:
+                    close_v = pr.get("close")
+                    vol_v = pr.get("volume")
+                    try:
+                        close_f = float(close_v)
+                        vol_f = float(vol_v)
+                    except (TypeError, ValueError):
+                        continue
+                    if close_f > 0 and vol_f >= 0:
+                        notional_series.append(close_f * vol_f)
+                if notional_series:
+                    tail = notional_series[-20:]
+                    avg_underlying_dollar_volume_20d = sum(tail) / len(tail)
+                    if avg_underlying_dollar_volume_20d > 0:
+                        gex_to_underlying_dollar_volume_ratio = net_gex / avg_underlying_dollar_volume_20d
+        except Exception:
+            avg_underlying_dollar_volume_20d = None
+            gex_to_underlying_dollar_volume_ratio = None
+
+        if avg_underlying_dollar_volume_20d is None:
+            # Fallback for indices where primary provider price history is empty/intermittent.
+            try:
+                import yfinance as yf  # type: ignore
+
+                yf_symbol = str(symbol).strip().upper()
+                if yf_symbol in {".SPX", "SPX", "SPXW", "^SPX"}:
+                    yf_symbol = "^GSPC"
+                hist = yf.download(
+                    yf_symbol,
+                    period="3mo",
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                )
+                if hist is not None and not hist.empty:
+                    closes = None
+                    vols = None
+                    if getattr(hist.columns, "nlevels", 1) > 1:
+                        sym_key = yf_symbol
+                        if ("Close", sym_key) in hist.columns and ("Volume", sym_key) in hist.columns:
+                            closes = hist[("Close", sym_key)].astype(float)
+                            vols = hist[("Volume", sym_key)].astype(float)
+                    else:
+                        if "Close" in hist.columns and "Volume" in hist.columns:
+                            closes = hist["Close"].astype(float)
+                            vols = hist["Volume"].astype(float)
+                    if closes is not None and vols is not None:
+                        notionals = (closes * vols).dropna().tolist()
+                        if notionals:
+                            tail = notionals[-20:]
+                            avg_underlying_dollar_volume_20d = sum(tail) / len(tail)
+                            if avg_underlying_dollar_volume_20d > 0:
+                                gex_to_underlying_dollar_volume_ratio = net_gex / avg_underlying_dollar_volume_20d
+            except Exception:
+                pass
+
+        out = {
+            "metadata": {
+                "symbol": str(symbol).strip().upper(),
+                "spot_price": spot,
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "gamma_flip_price": float(gamma_flip_price) if gamma_flip_price is not None else None,
+                "data_quality": {
+                    "rows_total": rows_total,
+                    "rows_usable": rows_usable,
+                    "quality_score": quality,
+                    "contract_multiplier": contract_mult,
+                    "mean_iv": mean_iv,
+                },
+            },
+            "aggregate_stats": {
+                "net_gex_nominal": net_gex,
+                "call_gex_nominal": call_gex_nominal,
+                "put_gex_nominal": put_gex_nominal,
+                "regime": summary.get("gamma_regime_est") or ("positive_gamma" if net_gex >= 0 else "negative_gamma"),
+                "alt_sign_convention": float(summary.get("net_gex_alt_sign") or -net_gex),
+                "gex_to_volume_ratio": (float(net_gex) / total_volume) if total_volume > 0 else None,
+                "total_abs_gex": total_abs_gex,
+                "gamma_purity": gamma_purity,
+                "concentration_index": concentration_index,
+                "gamma_skew": gamma_skew,
+                "put_gex_share": put_share,
+                "tail_risk_warning": tail_risk_warning,
+                "avg_underlying_dollar_volume_20d": avg_underlying_dollar_volume_20d,
+                "gex_to_underlying_dollar_volume_ratio": gex_to_underlying_dollar_volume_ratio,
+            },
+            "key_levels": {
+                "gamma_flip_price": float(gamma_flip_price) if gamma_flip_price is not None else None,
+                "zero_gamma_distance_pct": float(zero_gamma_distance_pct) if zero_gamma_distance_pct is not None else None,
+                "call_wall": float(call_wall) if call_wall is not None else None,
+                "put_wall": float(put_wall) if put_wall is not None else None,
+                "max_gamma_strike": float(max_gamma_strike) if max_gamma_strike is not None else None,
+            },
+            "risk_profile": {
+                "vanna_exposure*": float(total_vanna_exp),
+                "charm_exposure*": float(total_charm_exp),
+                "vanna_call_exposure*": float(vanna_call_exp),
+                "vanna_put_exposure*": float(vanna_put_exp),
+                "charm_call_exposure*": float(charm_call_exp),
+                "charm_put_exposure*": float(charm_put_exp),
+                "is_opex_week": bool(is_opex_week),
+                "volatility_bias": "stabilizing" if net_gex >= 0 else "amplifying",
+            },
+            "term_structure": {
+                "zero_dte": {"net_gex": float(bucket_net["zero_dte"]), "pct": zero_dte_pct},
+                "near_term_1w": {"net_gex": float(bucket_net["near_term_1w"]), "pct": _pct(bucket_net["near_term_1w"])},
+                "long_term": {"net_gex": float(bucket_net["long_term"]), "pct": _pct(bucket_net["long_term"])},
+            },
+            "profile_data_sample": profile_data_sample,
+            "flow_interpretation": flow_interpretation,
+            "regime_mapping": {
+                "volatility_acceleration": {
+                    "condition": net_gex < 0.0,
+                    "trigger": "net_gex_nominal < 0",
+                    "advice": "Avoid aggressive left-side dip buying; place protective stop below put_wall.",
+                },
+                "transition_zone": {
+                    "condition": spot_near_flip,
+                    "trigger": "abs(spot-gamma_flip_price)/spot <= 1%",
+                    "advice": "Volatility regime may switch soon; reduce short-vol inventory / consider take-profit on short-vol trades.",
+                },
+                "speculative_noise": {
+                    "condition": bool(zero_dte_pct is not None and zero_dte_pct > 50.0),
+                    "trigger": "zero_dte_pct > 50%",
+                    "advice": "Signal is mainly intraday; avoid using it as standalone swing horizon anchor.",
+                },
+            },
+            "assumptions": {
+                "method": "Black-Scholes gamma estimated from chain iv/oi",
+                "risk_free_rate": risk_free,
+                "risk_free_rate_source": meta.get("risk_free_rate_source"),
+                "expiration": resolved_expiration,
+            },
+        }
+        return out
 
     def get_futures_option_chain_analytics(
         self,
