@@ -31,8 +31,18 @@ class YFinanceProvider(DataProvider):
     ) -> list[Price]:
         is_crypto = is_crypto_ticker(ticker)
         symbol = ticker.strip().upper().replace("/", "-") if is_crypto else normalize_ticker(ticker)
+
+        # Yahoo Finance supports additional non-equity tickers (FX `...=X`, futures `...=F`,
+        # some indices `^...`, etc.). These may not map to a known equity market.
+        is_yahoo_special = (
+            ("=X" in symbol)
+            or ("=F" in symbol)
+            or symbol.startswith("^")
+            or symbol.endswith(".NYB")
+        )
+
         market = detect_market(symbol)
-        if not is_crypto and market.name != "US":
+        if not is_crypto and market.name != "US" and not is_yahoo_special:
             return self._fallback.get_prices(ticker, start_date, end_date, interval=interval)
 
         yf = self._import_yf()
@@ -118,7 +128,7 @@ class YFinanceProvider(DataProvider):
                     volume=max(volume, 0),
                     amount=float(volume) * close,
                     time=time_str,
-                    market=None if is_crypto else market,
+                    market=None if (is_crypto or market.name != "US") else market,
                 )
             )
         return out
@@ -135,7 +145,7 @@ class YFinanceProvider(DataProvider):
             return []
         return self._fallback.search_line_items(ticker, period, limit)
 
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,
@@ -143,7 +153,7 @@ class YFinanceProvider(DataProvider):
         limit: int = 10,
     ) -> list[CompanyNews]:
         # Crypto news is available via AkShare fallback, so don't block it.
-        return self._fallback.get_company_news(ticker, start_date, end_date, limit)
+        return self._fallback.get_company_news_raw(ticker, start_date, end_date, limit)
 
     def get_insider_trades(
         self,
@@ -163,3 +173,15 @@ class YFinanceProvider(DataProvider):
 
     def get_macro_indicators(self, start_date: str | None = None, end_date: str | None = None) -> dict:
         return self._fallback.get_macro_indicators(start_date, end_date)
+
+    def get_macro_indicators_subset(
+        self,
+        series_keys: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        # Delegate to fallback provider when available.
+        if hasattr(self._fallback, "get_macro_indicators_subset"):
+            fetch_subset = getattr(self._fallback, "get_macro_indicators_subset")
+            return fetch_subset(series_keys=series_keys, start_date=start_date, end_date=end_date)
+        return self._fallback.get_macro_indicators(start_date=start_date, end_date=end_date)

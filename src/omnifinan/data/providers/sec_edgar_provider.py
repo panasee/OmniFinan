@@ -952,7 +952,7 @@ class SECEDGARProvider(DataProvider):
             ak_items = []
         return self._merge_line_items_prefer_primary(sec_items, ak_items, limit)
 
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,

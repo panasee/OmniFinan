@@ -6,7 +6,7 @@ import time
 
 from ...data_models import CompanyNews, FinancialMetrics, InsiderTrade, LineItem, Price
 from ...unified_api import (
-    get_company_news,
+    _get_company_news_raw,
     get_financial_metrics,
     get_insider_trades,
     get_macro_indicators,
@@ -53,7 +53,7 @@ class AkshareProvider(DataProvider):
         self._throttle()
         return search_line_items(ticker=ticker, period=period, limit=limit)
 
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,
@@ -61,7 +61,7 @@ class AkshareProvider(DataProvider):
         limit: int = 10,
     ) -> list[CompanyNews]:
         self._throttle()
-        return get_company_news(symbol=ticker, start_date=start_date, end_date=end_date, limit=limit)
+        return _get_company_news_raw(symbol=ticker, start_date=start_date, end_date=end_date, limit=limit)
 
     def get_insider_trades(
         self,

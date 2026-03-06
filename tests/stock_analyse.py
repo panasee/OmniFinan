@@ -288,7 +288,7 @@ def main() -> None:
     parser.add_argument(
         "--data-provider",
         default="yfinance",
-        choices=["akshare", "finnhub", "yfinance"],
+        choices=["akshare", "yfinance"],
         help="Data provider backend",
     )
     parser.add_argument(

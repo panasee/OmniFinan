@@ -30,9 +30,21 @@ def load_provider_credentials() -> dict[str, Any]:
 
 def get_api_key(provider: str) -> str | None:
     payload = load_provider_credentials()
+    target = provider.strip().lower()
+
+    # Prefer legacy flat keys used by existing local configs, e.g. `tavily_key`.
+    for key_name in (
+        f"{target}_key",
+        f"{target}_api_key",
+        f"{target.upper()}_KEY",
+        f"{target.upper()}_API_KEY",
+    ):
+        val = payload.get(key_name)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
     node: Any = payload.get(provider)
     if not isinstance(node, dict):
-        target = provider.strip().lower()
         for key, value in payload.items():
             if isinstance(key, str) and key.strip().lower() == target and isinstance(value, dict):
                 node = value

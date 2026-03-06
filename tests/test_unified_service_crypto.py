@@ -42,7 +42,7 @@ class _DummyProvider(DataProvider):
     def search_line_items(self, ticker: str, period: str = "ttm", limit: int = 10) -> list[LineItem]:
         return []
 
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,

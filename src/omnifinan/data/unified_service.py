@@ -11,11 +11,11 @@ from typing import Any
 from pyomnix.omnix_logger import get_logger
 
 from ..analysis.options import compute_chain_analytics
+from ..data_models import MarketType
 from .cache import DataCache
+from .news import fetch_search_news, integrate_news_rows
 from .providers.base import DataProvider
-from .providers.marketdata_provider import MarketDataOptionsProvider
 from .providers.moomoo_options_provider import MoomooOptionsProvider
-from .providers.yfinance_options_provider import YFinanceOptionsProvider
 from .providers.yfinance_provider import YFinanceProvider
 from .symbols import (
     is_crypto_ticker,
@@ -32,9 +32,7 @@ class UnifiedDataService:
         self.cache = cache or DataCache()
         self.ttl_seconds = ttl_seconds
         self._crypto_provider: DataProvider | None = None
-        self._options_provider: MarketDataOptionsProvider | None = None
         self._moomoo_options_provider: MoomooOptionsProvider | None = None
-        self._yf_options_provider: YFinanceOptionsProvider | None = None
         self.cache.cleanup_expired(ttl_seconds)
 
     def _get_crypto_provider(self) -> DataProvider:
@@ -42,23 +40,75 @@ class UnifiedDataService:
             self._crypto_provider = YFinanceProvider()
         return self._crypto_provider
 
-    def _get_options_provider(self) -> MarketDataOptionsProvider:
-        if self._options_provider is None:
-            self._options_provider = MarketDataOptionsProvider()
-        return self._options_provider
-
     def _get_moomoo_options_provider(self) -> MoomooOptionsProvider:
         if self._moomoo_options_provider is None:
             self._moomoo_options_provider = MoomooOptionsProvider()
         return self._moomoo_options_provider
 
-    def _get_yf_options_provider(self) -> YFinanceOptionsProvider:
-        if self._yf_options_provider is None:
-            self._yf_options_provider = YFinanceOptionsProvider()
-        return self._yf_options_provider
-
     def _ticker_key(self, ticker: str) -> str:
         return ticker.upper().strip()
+
+    def _macro_source_policy_version(self) -> str:
+        from ..unified_api import MACRO_SOURCE_POLICY_VERSION
+
+        return MACRO_SOURCE_POLICY_VERSION
+
+    def _retired_macro_series_keys(self) -> set[str]:
+        from ..unified_api import RETIRED_MACRO_SERIES_KEYS
+
+        return set(RETIRED_MACRO_SERIES_KEYS)
+
+    def _prune_retired_macro_series(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return payload
+        retired = self._retired_macro_series_keys()
+        if not retired:
+            return payload
+        series = payload.get("series", {})
+        latest = payload.get("latest", {})
+        if not isinstance(series, dict) and not isinstance(latest, dict):
+            return payload
+        out = dict(payload)
+        if isinstance(series, dict):
+            out["series"] = {k: v for k, v in series.items() if k not in retired}
+        if isinstance(latest, dict):
+            out["latest"] = {k: v for k, v in latest.items() if k not in retired}
+        return out
+
+    def _retire_deprecated_macro_policy_caches(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> None:
+        active_policy_version = self._macro_source_policy_version()
+        deprecated_versions = (
+            "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+            "fixed_sources_v2_with_dbnomics_proxies",
+        )
+
+        for deprecated_version in deprecated_versions:
+            if deprecated_version == active_policy_version:
+                continue
+            self.cache.delete(
+                "macro_indicators",
+                {
+                    "scope": "master",
+                    "source_policy_version": deprecated_version,
+                },
+            )
+            self.cache.delete(
+                "macro_indicators_structured",
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "source_policy_version": deprecated_version,
+                    "view": "structured_v1",
+                },
+            )
+            self.cache.delete_dataset(
+                "macro_indicators_history",
+                f"{deprecated_version}__master",
+            )
 
     def _unsupported_stock_option_payload(self, symbol: str, reason: str) -> dict[str, Any]:
         clean_symbol = str(symbol or "").strip().upper()
@@ -237,6 +287,50 @@ class UnifiedDataService:
                 merged[key] = row
         return list(merged.values())
 
+    def _detect_market(self, ticker: str) -> MarketType:
+        from ..unified_api import detect_market, normalize_ticker
+
+        return detect_market(normalize_ticker(ticker))
+
+    def _normalize_raw_news(
+        self,
+        ticker: str,
+        market: MarketType,
+        items: list[Any],
+    ) -> list[dict[str, Any]]:
+        from .news import _coerce_company_news_rows
+
+        return _coerce_company_news_rows(ticker, market, items)
+
+    def _fetch_company_news_raw(
+        self,
+        ticker: str,
+        market: MarketType,
+        start_date: str | None,
+        end_date: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if market in {MarketType.CHINA, MarketType.CHINA_SH, MarketType.CHINA_SZ, MarketType.CHINA_BJ}:
+            return self._normalize_raw_news(
+                ticker,
+                market,
+                self.provider.get_company_news_raw(
+                    ticker=ticker,
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=limit,
+                ),
+            )
+        if market in {MarketType.US, MarketType.HK}:
+            return fetch_search_news(
+                ticker=ticker,
+                market=market,
+                start_date=start_date,
+                end_date=end_date,
+                limit=limit,
+            )
+        return []
+
     def _merge_insider_records(
         self,
         existing: list[dict[str, Any]],
@@ -258,7 +352,7 @@ class UnifiedDataService:
 
     def _merge_macro_payloads(self, existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
         if not existing:
-            return incoming
+            return self._prune_retired_macro_series(incoming) or incoming
         out = dict(existing)
         ex_series = existing.get("series", {}) if isinstance(existing.get("series"), dict) else {}
         in_series = incoming.get("series", {}) if isinstance(incoming.get("series"), dict) else {}
@@ -306,7 +400,7 @@ class UnifiedDataService:
             else None
             for key, val in merged_series.items()
         }
-        return out
+        return self._prune_retired_macro_series(out) or out
 
     def _is_non_empty_macro_payload(self, payload: dict[str, Any] | None) -> bool:
         if not isinstance(payload, dict):
@@ -597,7 +691,7 @@ class UnifiedDataService:
             filtered_series[key] = cloned
         out["series"] = filtered_series
         out["latest"] = latest_map
-        return out
+        return self._prune_retired_macro_series(out) or out
 
     def _sort_by_date(self, items: list[dict[str, Any]], date_field: str, descending: bool = False):
         return sorted(
@@ -783,7 +877,8 @@ class UnifiedDataService:
         end_date: str | None = None,
         force: bool = False,
     ):
-        source_policy_version = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"
+        self._retire_deprecated_macro_policy_caches(start_date=start_date, end_date=end_date)
+        source_policy_version = self._macro_source_policy_version()
         dataset_key = f"{source_policy_version}__master"
         params = {
             "scope": "master",
@@ -905,11 +1000,13 @@ class UnifiedDataService:
     ):
         from ..unified_api import structure_macro_indicators
 
+        self._retire_deprecated_macro_policy_caches(start_date=start_date, end_date=end_date)
         raw = self.get_macro_indicators(start_date=start_date, end_date=end_date, force=force)
+        source_policy_version = self._macro_source_policy_version()
         params = {
             "start_date": start_date,
             "end_date": end_date,
-            "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+            "source_policy_version": source_policy_version,
             "view": "structured_v1",
         }
         cached = None if force else self.cache.get("macro_indicators_structured", params, ttl_seconds=self.ttl_seconds)
@@ -927,61 +1024,87 @@ class UnifiedDataService:
         limit: int = 10,
     ):
         dataset_key = self._ticker_key(ticker)
-        stored = self.cache.get_dataset("company_news", dataset_key) or []
+        self.cache.delete_dataset("company_news", dataset_key)
+        market = self._detect_market(ticker)
+        stored = self.cache.get_dataset("company_news_raw", dataset_key) or []
+        stored_updated_at = self.cache.get_dataset_updated_at("company_news_raw", dataset_key)
         stored = self._sort_by_date(stored, "date", descending=True)
 
         target_end = self._parse_date(end_date or self._today_str())
         if not stored:
-            fetched = self._model_dump_list(
-                self.provider.get_company_news(
-                    ticker=ticker,
-                    start_date=start_date,
-                    end_date=end_date,
-                    limit=max(limit, 30),
-                )
+            fetched = self._fetch_company_news_raw(
+                ticker=ticker,
+                market=market,
+                start_date=start_date,
+                end_date=end_date,
+                limit=max(limit, 30),
             )
             if fetched:
                 stored = self._merge_news_records(stored, fetched)
+                stored_updated_at = None
         else:
             newest = self._parse_date(stored[0].get("date"))
             oldest = self._parse_date(stored[-1].get("date"))
+            recently_refreshed = (
+                stored_updated_at is not None and (datetime.now() - stored_updated_at) <= timedelta(hours=24)
+            )
 
-            if newest and target_end and newest < target_end:
+            if newest and target_end and newest < target_end and not recently_refreshed:
                 update_start = newest + timedelta(days=1)
                 if update_start <= target_end:
-                    updates = self._model_dump_list(
-                        self.provider.get_company_news(
-                            ticker=ticker,
-                            start_date=self._date_to_str(update_start),
-                            end_date=self._date_to_str(target_end),
-                            limit=max(limit * 3, 30),
-                        )
+                    updates = self._fetch_company_news_raw(
+                        ticker=ticker,
+                        market=market,
+                        start_date=self._date_to_str(update_start),
+                        end_date=self._date_to_str(target_end),
+                        limit=max(limit * 3, 30),
                     )
                     if updates:
                         stored = self._merge_news_records(stored, updates)
+                        stored_updated_at = None
 
             wanted_start = self._parse_date(start_date)
-            if wanted_start and oldest and wanted_start < oldest:
+            if wanted_start and oldest and wanted_start < oldest and not recently_refreshed:
                 backfill_end = oldest - timedelta(days=1)
                 if wanted_start <= backfill_end:
-                    backfill = self._model_dump_list(
-                        self.provider.get_company_news(
-                            ticker=ticker,
-                            start_date=self._date_to_str(wanted_start),
-                            end_date=self._date_to_str(backfill_end),
-                            limit=max(limit * 3, 30),
-                        )
+                    backfill = self._fetch_company_news_raw(
+                        ticker=ticker,
+                        market=market,
+                        start_date=self._date_to_str(wanted_start),
+                        end_date=self._date_to_str(backfill_end),
+                        limit=max(limit * 3, 30),
                     )
                     if backfill:
                         stored = self._merge_news_records(stored, backfill)
+                        stored_updated_at = None
 
         stored = self._sort_by_date(stored, "date", descending=True)
         if stored:
-            self.cache.set_dataset("company_news", dataset_key, stored)
+            self.cache.set_dataset("company_news_raw", dataset_key, stored)
+            stored_updated_at = self.cache.get_dataset_updated_at("company_news_raw", dataset_key)
 
         filtered = self._filter_by_date_range(stored, "date", start_date, end_date)
         filtered = self._sort_by_date(filtered, "date", descending=True)
-        return filtered[:limit]
+        integrated_key = f"{dataset_key}__{start_date or 'none'}__{end_date or 'none'}__{limit}"
+        cached_integrated = self.cache.get_dataset("company_news_integrated", integrated_key)
+        integrated_updated_at = self.cache.get_dataset_updated_at("company_news_integrated", integrated_key)
+        if (
+            cached_integrated
+            and integrated_updated_at is not None
+            and stored_updated_at is not None
+            and integrated_updated_at >= stored_updated_at
+        ):
+            return cached_integrated
+        integrated = integrate_news_rows(
+            ticker=ticker,
+            market=market,
+            rows=filtered,
+            limit=limit,
+        )
+        dumped = self._model_dump_list(integrated)
+        if dumped:
+            self.cache.set_dataset("company_news_integrated", integrated_key, dumped)
+        return dumped
 
     def get_insider_trades(
         self,
@@ -1069,57 +1192,20 @@ class UnifiedDataService:
                 return hit
 
         p = str(provider or "auto").strip().lower()
-        if p in {"yfinance", "yahooquery"}:
-            # Backward-compatible aliases.
-            p = "moomoo"
-        if p not in {"auto", "moomoo", "marketdata"}:
-            raise ValueError("provider must be one of {'auto', 'moomoo', 'marketdata'}")
+        if p not in {"auto", "moomoo"}:
+            raise ValueError("stock options provider must be one of {'auto', 'moomoo'}")
 
-        # User decision: stock options default to moomoo without fallback.
-        route = ["moomoo"] if p in {"auto", "moomoo"} else ["marketdata"]
-
-        payload: dict[str, Any] | None = None
-        for r in route:
-            if r == "moomoo":
-                try:
-                    payload = self._get_moomoo_options_provider().get_stock_option_chain(
-                        symbol=routed_symbol,
-                        expiration=expiration,
-                        option_type=option_type,
-                        strike=strike,
-                        min_dte=min_dte,
-                        max_dte=max_dte,
-                        snapshot_mode=snapshot_mode,
-                        snapshot_date=snapshot_date,
-                        extra_params=extra_params,
-                    )
-                    break
-                except Exception:
-                    if p == "moomoo" or p == "auto":
-                        raise
-                    continue
-
-            if r == "marketdata":
-                try:
-                    payload = self._get_options_provider().get_stock_option_chain(
-                        symbol=routed_symbol,
-                        expiration=expiration,
-                        option_type=option_type,
-                        strike=strike,
-                        min_dte=min_dte,
-                        max_dte=max_dte,
-                        snapshot_mode=snapshot_mode,
-                        snapshot_date=snapshot_date,
-                        extra_params=extra_params,
-                    )
-                    break
-                except Exception:
-                    if p == "marketdata":
-                        raise
-                    continue
-
-        if payload is None:
-            raise RuntimeError("failed to fetch stock option chain from all routed providers")
+        payload = self._get_moomoo_options_provider().get_stock_option_chain(
+            symbol=routed_symbol,
+            expiration=expiration,
+            option_type=option_type,
+            strike=strike,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            snapshot_mode=snapshot_mode,
+            snapshot_date=snapshot_date,
+            extra_params=extra_params,
+        )
         self.cache.set("stock_option_chain", params, payload)
         return payload
 
@@ -1156,19 +1242,19 @@ class UnifiedDataService:
             if isinstance(hit, dict):
                 return hit
         p = str(provider or "auto").strip().lower()
-        if p not in {"auto", "marketdata"}:
-            raise ValueError("futures options provider must be one of {'auto', 'marketdata'}")
-        payload = self._get_options_provider().get_futures_option_chain(
-            symbol=routed_symbol,
-            expiration=expiration,
-            option_type=option_type,
-            strike=strike,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            snapshot_mode=snapshot_mode,
-            snapshot_date=snapshot_date,
-            extra_params=extra_params,
-        )
+        if p not in {"auto", "moomoo"}:
+            raise ValueError("futures options provider must be one of {'auto', 'moomoo'}")
+        payload = {
+            "meta": {
+                "source": "fixed_sources_unavailable",
+                "asset_kind": "futures_option",
+                "symbol": routed_symbol,
+                "requested_symbol": symbol,
+                "error": "futures option chains are not supported in the current moomoo-only provider stack",
+            },
+            "data": [],
+            "raw": {},
+        }
         self.cache.set("futures_option_chain", params, payload)
         return payload
 
@@ -1281,9 +1367,44 @@ class UnifiedDataService:
                 hv_prices = []
         resolved_risk_free_rate, risk_free_rate_source = self._resolve_risk_free_rate(risk_free_rate)
         resolved_contract_multiplier = self._infer_contract_multiplier(symbol, contract_multiplier)
+
+        # Underlying spot resolution policy:
+        # - Do NOT use options-provider injected underlying prices.
+        # - Prefer OmniFinan price interfaces (get_prices) and use latest close.
         resolved_underlying_price = underlying_price
-        if resolved_underlying_price is None and isinstance(payload.get("meta"), dict):
-            resolved_underlying_price = payload.get("meta", {}).get("underlying_price")
+        resolved_underlying_price_source: str | None = None
+        if resolved_underlying_price is None:
+            try:
+                if isinstance(hv_prices, list) and hv_prices:
+                    last = hv_prices[-1]
+                    close_v = last.get("close")
+                    if close_v is not None:
+                        resolved_underlying_price = float(close_v)
+                        resolved_underlying_price_source = f"prices:close@{last.get('time')}"
+            except Exception:
+                pass
+
+        if resolved_underlying_price is None:
+            try:
+                end_dt = self._parse_date(resolved_snapshot) or date.today()
+                start_dt = end_dt - timedelta(days=10)
+                px_rows = self._model_dump_list(
+                    self.get_prices(
+                        ticker=symbol,
+                        start_date=self._date_to_str(start_dt),
+                        end_date=self._date_to_str(end_dt),
+                        interval="1d",
+                        force=False,
+                    )
+                )
+                if px_rows:
+                    last = px_rows[-1]
+                    close_v = last.get("close")
+                    if close_v is not None:
+                        resolved_underlying_price = float(close_v)
+                        resolved_underlying_price_source = f"prices:close@{last.get('time')}"
+            except Exception:
+                pass
 
         analytics = compute_chain_analytics(
             rows if isinstance(rows, list) else [],
@@ -1304,6 +1425,7 @@ class UnifiedDataService:
                 "risk_free_rate": resolved_risk_free_rate,
                 "risk_free_rate_source": risk_free_rate_source,
                 "contract_multiplier": resolved_contract_multiplier,
+                "underlying_price_source": resolved_underlying_price_source,
             },
             "data": rows if isinstance(rows, list) else [],
             "raw": payload.get("raw", {}) if isinstance(payload.get("raw"), dict) else {},

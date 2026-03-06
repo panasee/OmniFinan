@@ -29,7 +29,7 @@ class DataProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,

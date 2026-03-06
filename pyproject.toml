@@ -42,7 +42,8 @@ dependencies = [
     "flask",
     "pyyaml",
     "pandas-market-calendars",
-    "pyomnix"
+    "pyomnix",
+    "dbnomics"
 ]
 
 [project.optional-dependencies]

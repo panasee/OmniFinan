@@ -67,12 +67,33 @@ class MoomooOptionsProvider:
             return "put"
         return raw.lower()
 
+
     def _get_connection(self, host: str, port: int):
         try:
             from moomoo import OpenQuoteContext  # type: ignore
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("moomoo package not installed") from exc
         return OpenQuoteContext(host=host, port=port)
+
+    def _fetch_option_chain_once(
+        self,
+        *,
+        ctx,
+        symbol: str,
+        expiry: str,
+        option_cond_type: Any,
+        index_option_type: Any,
+    ):
+        from moomoo import OptionType  # type: ignore
+
+        return ctx.get_option_chain(
+            code=symbol,
+            index_option_type=index_option_type,
+            start=expiry,
+            end=expiry,
+            option_type=OptionType.ALL,
+            option_cond_type=option_cond_type,
+        )
 
     def get_stock_option_chain(
         self,
@@ -86,12 +107,17 @@ class MoomooOptionsProvider:
         snapshot_date: str | None = None,
         extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        from moomoo import OptionType, RET_OK  # type: ignore
+        from moomoo import IndexOptionType, OptionCondType, RET_OK  # type: ignore
 
         params = extra_params or {}
         host = str(params.get("host") or self.default_host)
         port = int(params.get("port") or self.default_port)
         normalized_symbol = self._normalize_symbol(symbol)
+
+        # SPX: enforce NORMAL index-option type by default (empirically avoids ret=-1 on some expiries).
+        index_option_type = IndexOptionType.NORMAL
+        # Keep ALL as default; cond-type does not fix missing expiries when ret=-1.
+        option_cond_type = OptionCondType.ALL
 
         ctx = self._get_connection(host=host, port=port)
         try:
@@ -114,25 +140,115 @@ class MoomooOptionsProvider:
             if expiration:
                 expiries = [d for d in expiries if d == expiration]
 
+            # NOTE: Underlying spot/volume must be resolved via OmniFinan price interfaces,
+            # not from the options provider. Keep underlying_price unset here.
+
             chunks: list[pd.DataFrame] = []
             expiry_stats: list[dict[str, Any]] = []
-            for exp in expiries:
+            # Empirical: ret=-1 is intermittent. Use retry + backoff + reconnect.
+            reconnect_every = int(params.get("reconnect_every", 12))
+            max_attempts = int(params.get("max_attempts", 6))
+            base_sleep_s = float(params.get("base_sleep_s", 0.25))
+            inter_expiry_sleep_s = float(params.get("inter_expiry_sleep_s", 0.2))
+
+            for i, exp in enumerate(expiries):
+                if reconnect_every > 0 and i > 0 and i % reconnect_every == 0:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+                    ctx = self._get_connection(host=host, port=port)
+
                 ret_chain = -1
                 chain_df = None
-                for _ in range(3):
-                    ret_chain, chain_df = ctx.get_option_chain(
-                        code=normalized_symbol,
-                        start=exp,
-                        end=exp,
-                        option_type=OptionType.ALL,
-                    )
+                for attempt in range(max_attempts):
+                    try:
+                        ret_chain, chain_df = self._fetch_option_chain_once(
+                            ctx=ctx,
+                            symbol=normalized_symbol,
+                            expiry=exp,
+                            option_cond_type=option_cond_type,
+                            index_option_type=index_option_type,
+                        )
+                    except Exception:
+                        ret_chain, chain_df = -1, None
+
                     if ret_chain == RET_OK and chain_df is not None:
                         break
-                    time.sleep(0.15)
+
+                    # exponential-ish backoff
+                    time.sleep(base_sleep_s * (1.5 ** attempt))
+
+                    # reconnect on later failures
+                    if attempt in {2, 4}:
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        time.sleep(0.25)
+                        ctx = self._get_connection(host=host, port=port)
+
                 rows = int(len(chain_df)) if ret_chain == RET_OK and chain_df is not None else 0
-                expiry_stats.append({"expiry": exp, "ret": int(ret_chain), "rows": rows})
+                expiry_stats.append({"expiry": exp, "ret": int(ret_chain), "rows": rows, "attempts": (attempt + 1)})
                 if ret_chain == RET_OK and chain_df is not None and not chain_df.empty:
                     chunks.append(chain_df.copy())
+
+                # Fixed pacing between expiries to reduce flow control / ret=-1 bursts.
+                if inter_expiry_sleep_s > 0:
+                    time.sleep(inter_expiry_sleep_s)
+
+            # Second pass: rerun failed expiries with fresh sessions.
+            # Empirical: this recovers many transient ret=-1 failures.
+            failed_expiries = [s["expiry"] for s in expiry_stats if int(s.get("ret", -1)) != RET_OK]
+            rerun_enabled = bool(params.get("rerun_failed_expiries", True))
+            if rerun_enabled and failed_expiries:
+                rerun_max_attempts = int(params.get("rerun_max_attempts", 10))
+                rerun_base_sleep_s = float(params.get("rerun_base_sleep_s", 0.35))
+                rerun_post_sleep_s = float(params.get("rerun_post_sleep_s", 0.4))
+
+                for exp in failed_expiries:
+                    # Fresh connection per expiry.
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+                    ctx = self._get_connection(host=host, port=port)
+
+                    ret_chain = -1
+                    chain_df = None
+                    for attempt in range(rerun_max_attempts):
+                        try:
+                            ret_chain, chain_df = self._fetch_option_chain_once(
+                                ctx=ctx,
+                                symbol=normalized_symbol,
+                                expiry=exp,
+                                option_cond_type=option_cond_type,
+                                index_option_type=index_option_type,
+                            )
+                        except Exception:
+                            ret_chain, chain_df = -1, None
+
+                        if ret_chain == RET_OK and chain_df is not None:
+                            break
+                        time.sleep(rerun_base_sleep_s * (1.7 ** attempt))
+
+                    rows = int(len(chain_df)) if ret_chain == RET_OK and chain_df is not None else 0
+                    expiry_stats.append(
+                        {
+                            "expiry": exp,
+                            "ret": int(ret_chain),
+                            "rows": rows,
+                            "attempts": (attempt + 1),
+                            "phase": "rerun_failed",
+                        }
+                    )
+                    if ret_chain == RET_OK and chain_df is not None and not chain_df.empty:
+                        chunks.append(chain_df.copy())
+
+                    if rerun_post_sleep_s > 0:
+                        time.sleep(rerun_post_sleep_s)
 
             if not chunks:
                 return {
@@ -153,12 +269,50 @@ class MoomooOptionsProvider:
             chain = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["code"])
 
             contract_codes = chain["code"].dropna().astype(str).tolist()
-            snapshots: list[pd.DataFrame] = []
-            for i in range(0, len(contract_codes), self.snapshot_batch_size):
-                batch = contract_codes[i : i + self.snapshot_batch_size]
-                ret_snap, snap_df = ctx.get_market_snapshot(batch)
-                if ret_snap == RET_OK and snap_df is not None and not snap_df.empty:
-                    snapshots.append(snap_df)
+
+            def _snapshot_batches(code_list: list[str], batch_size: int) -> list[pd.DataFrame]:
+                out_batches: list[pd.DataFrame] = []
+                for j in range(0, len(code_list), batch_size):
+                    batch = code_list[j : j + batch_size]
+                    ret_snap, snap_df = ctx.get_market_snapshot(batch)
+                    if ret_snap == RET_OK and snap_df is not None and not snap_df.empty:
+                        out_batches.append(snap_df)
+                return out_batches
+
+            # Snapshot enrichment (dynamic fields). Empirical: can return partial coverage.
+            snapshots: list[pd.DataFrame] = _snapshot_batches(contract_codes, self.snapshot_batch_size)
+
+            # Retry snapshot for missing codes with smaller batches + backoff.
+            snapshot_retry_rounds = int(params.get("snapshot_retry_rounds", 2))
+            snapshot_retry_batch = int(params.get("snapshot_retry_batch", 50))
+            snapshot_retry_sleep_s = float(params.get("snapshot_retry_sleep_s", 0.6))
+
+            if snapshots and snapshot_retry_rounds > 0:
+                got = pd.concat(snapshots, ignore_index=True)
+                got_codes = set(got["code"].dropna().astype(str).tolist()) if "code" in got.columns else set()
+                missing = [c for c in contract_codes if c not in got_codes]
+
+                for r in range(snapshot_retry_rounds):
+                    if not missing:
+                        break
+                    # Backoff between rounds.
+                    time.sleep(snapshot_retry_sleep_s * (1.4 ** r))
+
+                    # Refresh connection defensively.
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+                    ctx = self._get_connection(host=host, port=port)
+
+                    new_batches = _snapshot_batches(missing, snapshot_retry_batch)
+                    if not new_batches:
+                        continue
+                    snapshots.extend(new_batches)
+                    got = pd.concat(snapshots, ignore_index=True)
+                    got_codes = set(got["code"].dropna().astype(str).tolist()) if "code" in got.columns else set()
+                    missing = [c for c in contract_codes if c not in got_codes]
 
             if snapshots:
                 snap = pd.concat(snapshots, ignore_index=True)
@@ -166,6 +320,9 @@ class MoomooOptionsProvider:
                     c
                     for c in [
                         "code",
+                        "bid_price",
+                        "ask_price",
+                        "last_price",
                         "option_open_interest",
                         "volume",
                         "option_implied_volatility",
@@ -203,6 +360,7 @@ class MoomooOptionsProvider:
                 bid = self._to_float(row.get("bid_price"))
                 ask = self._to_float(row.get("ask_price"))
                 mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+                last = self._to_float(row.get("last_price"))
 
                 rows.append(
                     {
@@ -216,7 +374,7 @@ class MoomooOptionsProvider:
                         "bid": bid,
                         "ask": ask,
                         "mid": mid,
-                        "last": self._to_float(row.get("last_price")),
+                        "last": last,
                         "openInterest": self._to_float(row.get("option_open_interest")),
                         "volume": self._to_float(row.get("volume")),
                         "inTheMoney": None,

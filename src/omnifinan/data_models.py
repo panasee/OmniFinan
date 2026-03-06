@@ -207,10 +207,55 @@ class CompanyNews(BaseModel):
     keyword: str | None = None  # 关键词
 
 
+class IntegratedNewsSource(BaseModel):
+    """Normalized source entry within an integrated news event."""
+
+    publisher: str
+    source_type: str
+    weight: float
+    url: str
+    domain: str | None = None
+    search_provider: str | None = None
+    published_at: str | None = None
+    title: str | None = None
+    snippet: str | None = None
+
+
+class IntegratedNewsEvent(BaseModel):
+    """Cross-verified integrated news event returned by get_company_news."""
+
+    event_id: str
+    ticker: str
+    market: MarketType | None = None
+    headline: str
+    summary: str | None = None
+    published_at: str
+    first_seen_at: str | None = None
+    latest_seen_at: str | None = None
+    primary_source: str
+    source_count: int = 0
+    high_weight_source_count: int = 0
+    weighted_source_score: float = 0.0
+    consensus_passed: bool = False
+    official_confirmed: bool = False
+    sources: list[IntegratedNewsSource] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    sentiment: str | None = None
+    # Compatibility aliases for old CompanyNews consumers.
+    title: str
+    source: str
+    date: str
+    url: str
+    publish_time: str | None = None
+    content: str | None = None
+    keyword: str | None = None
+
+
 class CompanyNewsResponse(BaseModel):
     """Response model for company news"""
 
-    news: list[CompanyNews]
+    news: list[IntegratedNewsEvent]
     market: MarketType | None = None
 
 

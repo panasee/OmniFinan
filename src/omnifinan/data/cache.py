@@ -59,6 +59,15 @@ class DataCache:
             json.dump({"data": data}, f, ensure_ascii=False, indent=2)
         self._cleanup_namespace(self.request_root, namespace)
 
+    def delete(self, namespace: str, params: dict[str, Any]) -> None:
+        path = self._request_key_path(namespace, params)
+        if not path.exists():
+            return
+        try:
+            path.unlink()
+        except Exception:
+            return
+
     def _sanitize_key(self, key: str) -> str:
         return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in key)
 
@@ -78,6 +87,15 @@ class DataCache:
         except Exception:
             return None
 
+    def get_dataset_updated_at(self, namespace: str, key: str) -> datetime | None:
+        path = self._dataset_path(namespace, key)
+        if not path.exists():
+            return None
+        try:
+            return datetime.fromtimestamp(path.stat().st_mtime)
+        except Exception:
+            return None
+
     def set_dataset(self, namespace: str, key: str, data: Any) -> None:
         path = self._dataset_path(namespace, key)
         payload = {
@@ -88,6 +106,15 @@ class DataCache:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         self._cleanup_namespace(self.dataset_root, namespace)
+
+    def delete_dataset(self, namespace: str, key: str) -> None:
+        path = self._dataset_path(namespace, key)
+        if not path.exists():
+            return
+        try:
+            path.unlink()
+        except Exception:
+            return
 
     def cleanup_expired(self, ttl_seconds: int) -> int:
         removed = 0

@@ -356,6 +356,7 @@ def compute_chain_analytics(
     price_history: list[dict[str, Any]] | None = None,
     iv_history: list[float] | None = None,
     hv_lookback_days: int = 20,
+    contract_multiplier: float = 100.0,
 ) -> dict[str, Any]:
     snapshot_dt = _parse_snapshot_datetime(snapshot_date)
 
@@ -496,6 +497,19 @@ def compute_chain_analytics(
     max_pain = _compute_max_pain_from_rows(rows)
     levels = _compute_oi_levels(rows)
 
+    # Estimated GEX (Black-Scholes gamma + OI), explicit as estimated metric.
+    call_gex_est = sum(
+        float(x["gamma"]) * float(x["open_interest"]) * float(contract_multiplier) * (spot**2) * 0.01
+        for x in enriched
+        if x["type"] == "call"
+    )
+    put_gex_est = -sum(
+        float(x["gamma"]) * float(x["open_interest"]) * float(contract_multiplier) * (spot**2) * 0.01
+        for x in enriched
+        if x["type"] == "put"
+    )
+    net_gex_est = call_gex_est + put_gex_est
+
     errors: list[str] = []
     if hv is None:
         errors.append("Insufficient price history for historical volatility.")
@@ -515,6 +529,13 @@ def compute_chain_analytics(
                 sorted(x["iv"] for x in enriched)[len(enriched) // 2] if enriched else None
             ),
             "iv_historical_percentile": iv_percentile,
+            "risk_free_rate": float(risk_free_rate),
+            "contract_multiplier": float(contract_multiplier),
+            "call_gex_est": float(call_gex_est),
+            "put_gex_est": float(put_gex_est),
+            "net_gex_est": float(net_gex_est),
+            "net_gex_alt_sign": float(-net_gex_est),
+            "gamma_regime_est": "positive_gamma" if net_gex_est >= 0 else "negative_gamma",
         },
         "surface": enriched,
         "term_structure": term_structure,

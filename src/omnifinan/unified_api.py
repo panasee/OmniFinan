@@ -34,11 +34,13 @@ from pyomnix.consts import OMNIX_PATH
 from pyomnix.omnix_logger import get_logger
 
 from .utils.holidays import filter_trading_days
+from .data.symbols import normalize_crypto_option_underlying
 
 # Import data models (assuming they are defined correctly AND reflect the original structure)
 from .data_models import (
     CompanyNews,
     FinancialMetrics,
+    IntegratedNewsEvent,
     InsiderTrade,
     LineItem,
     MarketType,
@@ -51,6 +53,11 @@ logger = get_logger("unified_api")
 
 AKSHARE_REQUEST_INTERVAL_SECONDS = 0.5
 AKSHARE_MAX_RETRIES = 3
+RETIRED_MACRO_SERIES_KEYS = {
+    "china_cpi_yoy",
+    "china_industrial_production_yoy",
+    "china_imports_yoy",
+}
 
 # --- Helper Functions ---
 
@@ -424,7 +431,7 @@ def _normalize_macro_series(
     return payload
 
 
-MACRO_SOURCE_POLICY_VERSION = "fixed_sources_v2_with_dbnomics_proxies"
+MACRO_SOURCE_POLICY_VERSION = "fixed_sources_with_dbnomics_proxies"
 
 
 def _coerce_macro_date_series(s: pd.Series) -> pd.Series:
@@ -491,10 +498,6 @@ def _macro_error_payload(series_name: str, source: str, error: str) -> dict[str,
 
 
 def _get_fred_api_key() -> str | None:
-    env_key = os.getenv("FRED_API_KEY", "").strip()
-    if env_key:
-        return env_key
-
     try:
         from .data.providers.credentials import get_api_key, load_provider_credentials
 
@@ -1284,6 +1287,42 @@ def _clone_series_payload(base_payload: dict[str, Any], *, series_name: str, sou
     return cloned
 
 
+def _rebase_index_payload(
+    base_payload: dict[str, Any],
+    *,
+    series_name: str,
+    source: str,
+    baseline: float = 100.0,
+) -> dict[str, Any]:
+    if not isinstance(base_payload, dict):
+        return _macro_error_payload(series_name, source, "base payload unavailable")
+    obs = base_payload.get("observations", [])
+    if not isinstance(obs, list) or not obs:
+        return _macro_error_payload(series_name, source, "base observations unavailable")
+    rows: list[dict[str, Any]] = []
+    for row in obs:
+        if not isinstance(row, dict):
+            continue
+        d = row.get("date")
+        v = row.get("value")
+        if d is None or v is None:
+            continue
+        try:
+            rows.append({"date": d, "value": float(v) - baseline})
+        except Exception:
+            continue
+    if not rows:
+        return _macro_error_payload(series_name, source, "base observations unavailable")
+    df = pd.DataFrame(rows)
+    return _normalize_macro_series(
+        df[["date", "value"]],
+        series_name=series_name,
+        source=source,
+        date_col="date",
+        value_col="value",
+    )
+
+
 def get_macro_indicators(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -1365,14 +1404,11 @@ def get_macro_indicators(
             end_date=end_date,
         )
     if _want("us_consumer_confidence_cb"):
-        results["series"]["us_consumer_confidence_cb"] = _akshare_fetch_series(
+        results["series"]["us_consumer_confidence_cb"] = _fred_fetch_series(
             series_name="us_consumer_confidence_cb",
-            fetcher_name="macro_usa_cb_consumer_confidence",
-            source="akshare:us_macro:macro_usa_cb_consumer_confidence",
+            series_id="USACSCICP02STSAM",
             start_date=start_date,
             end_date=end_date,
-            date_col="日期",
-            value_col="今值",
         )
     if _want("us_consumer_sentiment_michigan"):
         # Prefer FRED for timeliness/stability (AkShare feed can lag).
@@ -1741,7 +1777,6 @@ def get_macro_indicators(
         end_date=end_date,
     )
     if _want("eu_industrial_confidence_indicator"):
-        # Canonical replacement for (previous) euro-area manufacturing PMI feed.
         results["series"]["eu_industrial_confidence_indicator"] = _dbnomics_fetch_series(
             series_name="eu_industrial_confidence_indicator",
             provider_code="Eurostat",
@@ -1843,26 +1878,24 @@ def get_macro_indicators(
             "value_col": "LPR1Y",
         },
         {"key": "china_shibor_3m", "fetcher_name": "macro_china_shibor_all", "source": "akshare:china_official:cfets"},
-        {"key": "china_cpi_yoy", "fetcher_name": "macro_china_cpi_yearly", "source": "akshare:china_official:nbs"},
         {
             "key": "china_cpi_mom",
-            "fetcher_name": "macro_china_cpi_monthly",
-            "source": "akshare:china_official:nbs",
-            "date_col": "日期",
-            "value_col": "今值",
+            "fetcher_name": "__dbnomics__NBS_M_A01030G_A01030G01",
+            "source": "dbnomics:NBS/M_A01030G/A01030G01",
         },
-        {"key": "china_ppi_yoy", "fetcher_name": "macro_china_ppi_yearly", "source": "akshare:china_official:nbs"},
-        {"key": "china_gdp_yoy", "fetcher_name": "macro_china_gdp_yearly", "source": "akshare:china_official:nbs"},
-        {"key": "china_pmi_manufacturing", "fetcher_name": "macro_china_pmi_yearly", "source": "akshare:china_official:nbs"},
-        # Canonical replacements for Caixin PMI feeds.
-        # Use NBS PMI series via DBnomics.
         {
-            "key": "china_pmi_manufacturing_nbs",
+            "key": "china_ppi_yoy",
+            "fetcher_name": "__dbnomics__NBS_M_A010801_A01080101",
+            "source": "dbnomics:NBS/M_A010801/A01080101",
+        },
+        {"key": "china_gdp_yoy", "fetcher_name": "macro_china_gdp_yearly", "source": "akshare:china_official:nbs"},
+        {
+            "key": "china_pmi_manufacturing",
             "fetcher_name": "__dbnomics__NBS_M_A0B01_A0B0101",
             "source": "dbnomics:NBS/M_A0B01/A0B0101",
         },
         {
-            "key": "china_pmi_services_nbs",
+            "key": "china_pmi_services",
             "fetcher_name": "__dbnomics__NBS_M_A0B02_A0B020C",
             "source": "dbnomics:NBS/M_A0B02/A0B020C",
         },
@@ -1874,7 +1907,7 @@ def get_macro_indicators(
             "date_col": "date",
             "value_col": "value",
         },
-        {"key": "china_m2_yoy_nbs", "fetcher_name": "__dbnomics__NBS_M_A0D01_A0D0102", "source": "dbnomics:NBS/M_A0D01/A0D0102"},
+        {"key": "china_m2_yoy", "fetcher_name": "__dbnomics__NBS_M_A0D01_A0D0102", "source": "dbnomics:NBS/M_A0D01/A0D0102"},
         {
             "key": "china_social_financing",
             "fetcher_name": "macro_china_shrzgm",
@@ -1906,11 +1939,9 @@ def get_macro_indicators(
             "date_col": "月份",
             "value_col": "同比增长",
         },
-        {"key": "china_industrial_production_yoy", "fetcher_name": "macro_china_industrial_production_yoy", "source": "akshare:china_official:nbs"},
         {"key": "china_exports_yoy", "fetcher_name": "macro_china_exports_yoy", "source": "akshare:china_official:customs"},
-        {"key": "china_imports_yoy", "fetcher_name": "macro_china_imports_yoy", "source": "akshare:china_official:customs"},
         {"key": "china_trade_balance", "fetcher_name": "macro_china_trade_balance", "source": "akshare:china_official:customs"},
-        {"key": "china_fx_reserves_usd_imf", "fetcher_name": "__dbnomics__IMF_IFS_RAXGFX_USD", "source": "dbnomics:IMF/IFS:RAXGFX_USD:CN"},
+        {"key": "china_fx_reserves", "fetcher_name": "__dbnomics__IMF_IFS_RAXGFX_USD", "source": "dbnomics:IMF/IFS:RAXGFX_USD:CN"},
     ]
     for spec in china_specs:
         if not _want(str(spec["key"])):
@@ -1944,6 +1975,34 @@ def get_macro_indicators(
                     series_code="A0D0102",
                     start_date=start_date,
                     end_date=end_date,
+                )
+            elif fetcher_name == "__dbnomics__NBS_M_A01030G_A01030G01":
+                base_payload = _dbnomics_fetch_series(
+                    series_name=str(spec["key"]),
+                    provider_code="NBS",
+                    dataset_code="M_A01030G",
+                    series_code="A01030G01",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                results["series"][spec["key"]] = _rebase_index_payload(
+                    base_payload,
+                    series_name=str(spec["key"]),
+                    source=str(spec["source"]),
+                )
+            elif fetcher_name == "__dbnomics__NBS_M_A010801_A01080101":
+                base_payload = _dbnomics_fetch_series(
+                    series_name=str(spec["key"]),
+                    provider_code="NBS",
+                    dataset_code="M_A010801",
+                    series_code="A01080101",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                results["series"][spec["key"]] = _rebase_index_payload(
+                    base_payload,
+                    series_name=str(spec["key"]),
+                    source=str(spec["source"]),
                 )
             elif fetcher_name == "__dbnomics__IMF_IFS_RAXGFX_USD":
                 # IMF/IFS reserves proxy uses dimensions; fall back to DBnomics Python client.
@@ -2008,8 +2067,8 @@ def get_macro_indicators(
     results["snapshot_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     results["source_policy"] = {
         "version": MACRO_SOURCE_POLICY_VERSION,
-        "china": ["akshare:china_official"],
-        "international": ["fred", "imf_datamapper", "world_bank", "akshare:us_macro_ism"],
+        "china": ["akshare:china_official", "dbnomics:nbs", "dbnomics:imf_ifs_proxy"],
+        "international": ["fred", "imf_datamapper", "world_bank", "dbnomics:eurostat", "akshare:us_macro_ism"],
         "manual_overrides": ["local:us_pmi_json"],
     }
     results["latest"] = {
@@ -2032,14 +2091,11 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "us_non_farm_payrolls": "growth",
     "china_gdp_yoy": "growth",
     "china_pmi_manufacturing": "growth",
-    "china_pmi_manufacturing_nbs": "growth",
-    "china_pmi_services_nbs": "growth",
+    "china_pmi_services": "growth",
     "china_pmi_non_manufacturing": "growth",
-    "china_industrial_production_yoy": "growth",
     "china_retail_sales_yoy": "growth",
     "china_fixed_asset_investment_yoy": "growth",
     "china_exports_yoy": "growth",
-    "china_imports_yoy": "growth",
     "sg_gdp_growth": "growth",
     "sg_gdp_yoy": "growth",
     "sg_industrial_production_yoy": "growth",
@@ -2050,7 +2106,6 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "us_core_cpi_yoy": "inflation",
     "us_core_pce_price": "inflation",
     "us_breakeven_10y": "inflation",
-    "china_cpi_yoy": "inflation",
     "china_cpi_mom": "inflation",
     "china_ppi_yoy": "inflation",
     "sg_inflation_cpi": "inflation",
@@ -2061,8 +2116,8 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "pboc_policy_rate": "liquidity",
     "sofr": "liquidity",
     "us_m2": "liquidity",
-    "china_m2_yoy_nbs": "liquidity",
-    "china_fx_reserves_usd_imf": "liquidity",
+    "china_m2_yoy": "liquidity",
+    "china_fx_reserves": "liquidity",
     "sg_broad_money_growth": "liquidity",
     "us_central_bank_total_assets": "liquidity",
     "china_central_bank_balance_sheet": "liquidity",
@@ -2534,7 +2589,7 @@ def get_prices(
     interval: Literal["1d", "1m", "3m", "5m", "15m", "30m", "60m"] = "1d",
     adjustment: Literal["qfq", "hfq", ""] = "",
     api: Literal["sina", "em"] = "sina",
-    provider: Literal["akshare", "finnhub", "yfinance"] = "akshare",
+    provider: Literal["akshare", "yfinance"] = "akshare",
     force: bool = False,
 ) -> list[Price]:
     """
@@ -2783,61 +2838,26 @@ def get_stock_option_chain(
     max_dte: int | None = None,
     snapshot_mode: Literal["prev_close", "realtime"] = "prev_close",
     snapshot_date: str | None = None,
-    provider: Literal["auto", "moomoo", "marketdata", "yahooquery", "yfinance"] = "auto",
+    provider: Literal["auto", "moomoo"] = "auto",
     extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Fetch US stock option chain from optional providers."""
+    """Fetch US stock option chain from the moomoo provider."""
     provider_name = str(provider or "auto").strip().lower()
-    if provider_name in {"yfinance", "yahooquery"}:
-        # Backward-compatible aliases.
-        provider_name = "moomoo"
-    if provider_name not in {"auto", "moomoo", "marketdata"}:
-        raise ValueError("provider must be one of {'auto', 'moomoo', 'marketdata'}")
+    if provider_name not in {"auto", "moomoo"}:
+        raise ValueError("provider must be one of {'auto', 'moomoo'}")
+    from .data.providers.moomoo_options_provider import MoomooOptionsProvider
 
-    route: list[str] = ["moomoo"] if provider_name in {"auto", "moomoo"} else ["marketdata"]
-
-    for r in route:
-        if r == "moomoo":
-            from .data.providers.moomoo_options_provider import MoomooOptionsProvider
-
-            try:
-                return MoomooOptionsProvider().get_stock_option_chain(
-                    symbol=symbol,
-                    expiration=expiration,
-                    option_type=option_type,
-                    strike=strike,
-                    min_dte=min_dte,
-                    max_dte=max_dte,
-                    snapshot_mode=snapshot_mode,
-                    snapshot_date=snapshot_date,
-                    extra_params=extra_params,
-                )
-            except Exception:
-                if provider_name in {"auto", "moomoo"}:
-                    raise
-                continue
-
-        if r == "marketdata":
-            from .data.providers.marketdata_provider import MarketDataOptionsProvider
-
-            try:
-                return MarketDataOptionsProvider().get_stock_option_chain(
-                    symbol=symbol,
-                    expiration=expiration,
-                    option_type=option_type,
-                    strike=strike,
-                    min_dte=min_dte,
-                    max_dte=max_dte,
-                    snapshot_mode=snapshot_mode,
-                    snapshot_date=snapshot_date,
-                    extra_params=extra_params,
-                )
-            except Exception:
-                if provider_name == "marketdata":
-                    raise
-                continue
-
-    raise RuntimeError("failed to fetch stock option chain from all routed providers")
+    return MoomooOptionsProvider().get_stock_option_chain(
+        symbol=symbol,
+        expiration=expiration,
+        option_type=option_type,
+        strike=strike,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        snapshot_mode=snapshot_mode,
+        snapshot_date=snapshot_date,
+        extra_params=extra_params,
+    )
 
 
 def get_futures_option_chain(
@@ -2849,26 +2869,25 @@ def get_futures_option_chain(
     max_dte: int | None = None,
     snapshot_mode: Literal["prev_close", "realtime"] = "prev_close",
     snapshot_date: str | None = None,
-    provider: Literal["auto", "marketdata"] = "auto",
+    provider: Literal["auto", "moomoo"] = "auto",
     extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Fetch futures option chain (MarketData currently)."""
+    """Futures option chain is unavailable in the current moomoo-only provider stack."""
     provider_name = str(provider or "auto").strip().lower()
-    if provider_name not in {"auto", "marketdata"}:
-        raise ValueError("futures options provider must be one of {'auto', 'marketdata'}")
-    from .data.providers.marketdata_provider import MarketDataOptionsProvider
-
-    return MarketDataOptionsProvider().get_futures_option_chain(
-        symbol=symbol,
-        expiration=expiration,
-        option_type=option_type,
-        strike=strike,
-        min_dte=min_dte,
-        max_dte=max_dte,
-        snapshot_mode=snapshot_mode,
-        snapshot_date=snapshot_date,
-        extra_params=extra_params,
-    )
+    if provider_name not in {"auto", "moomoo"}:
+        raise ValueError("futures options provider must be one of {'auto', 'moomoo'}")
+    clean_symbol = normalize_crypto_option_underlying(symbol)
+    return {
+        "meta": {
+            "source": "fixed_sources_unavailable",
+            "asset_kind": "futures_option",
+            "symbol": clean_symbol,
+            "requested_symbol": symbol,
+            "error": "futures option chains are not supported in the current moomoo-only provider stack",
+        },
+        "data": [],
+        "raw": {},
+    }
 
 
 def get_financial_metrics(
@@ -3994,6 +4013,21 @@ def get_stock_news(
     return result
 
 
+def _get_company_news_raw(
+    symbol: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 10,
+) -> list[CompanyNews]:
+    """Raw provider-level company news rows used internally by raw providers."""
+    return get_stock_news(
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+    )
+
+
 def get_market_cap(
     ticker: str,
     end_date: str | None = None,
@@ -4122,14 +4156,29 @@ def get_company_news(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 10,
-) -> list[CompanyNews]:
-    """Backward-compatible alias for get_stock_news."""
-    return get_stock_news(
-        symbol=symbol,
+) -> list[IntegratedNewsEvent]:
+    """Return integrated company news events with deterministic cross-verification."""
+    from .data.cache import DataCache
+    from .data.providers.factory import create_data_provider
+    from .data.unified_service import UnifiedDataService
+
+    service = UnifiedDataService(
+        provider=create_data_provider("akshare"),
+        cache=DataCache(),
+    )
+    rows = service.get_company_news(
+        ticker=symbol,
         start_date=start_date,
         end_date=end_date,
         limit=limit,
     )
+    out: list[IntegratedNewsEvent] = []
+    for row in rows:
+        if isinstance(row, IntegratedNewsEvent):
+            out.append(row)
+        elif isinstance(row, dict):
+            out.append(IntegratedNewsEvent(**row))
+    return out
 
 
 def prices_to_df(prices: list[Price]) -> pd.DataFrame:
@@ -4211,7 +4260,7 @@ def get_price_df(
     start_date: str | None = None,
     end_date: str | None = None,
     interval: Literal["1d", "1m", "3m", "5m", "15m", "30m", "60m"] = "1d",
-    provider: Literal["akshare", "finnhub", "yfinance"] = "akshare",
+    provider: Literal["akshare", "yfinance"] = "akshare",
 ) -> pd.DataFrame:
     """
     Fetch price data for the given ticker and convert directly to DataFrame,
