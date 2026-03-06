@@ -6,7 +6,7 @@ from omnifinan.data.cache import DataCache
 from omnifinan.data.providers.base import DataProvider
 from omnifinan.data.unified_service import UnifiedDataService
 from omnifinan.data_models import CompanyNews, FinancialMetrics, InsiderTrade, LineItem, Price
-from omnifinan.unified_api import structure_macro_indicators
+from omnifinan.unified_api import MACRO_SOURCE_POLICY_VERSION, structure_macro_indicators
 
 
 def _obs_monthly(values: list[float], *, start_year: int = 2024, start_month: int = 1):
@@ -25,7 +25,7 @@ def _obs_monthly(values: list[float], *, start_year: int = 2024, start_month: in
 def test_structure_macro_indicators_builds_llm_and_chart_friendly_payload():
     payload = {
         "snapshot_at": "2026-02-16T00:00:00Z",
-        "source_policy": {"version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"},
+        "source_policy": {"version": MACRO_SOURCE_POLICY_VERSION},
         "series": {
             "us_cpi_yoy": {
                 "source": "fred:CPIAUCSL",
@@ -94,7 +94,7 @@ class _MacroStructuredDummyProvider(DataProvider):
     def search_line_items(self, ticker: str, period: str = "ttm", limit: int = 10) -> list[LineItem]:
         return []
 
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,
@@ -118,7 +118,7 @@ class _MacroStructuredDummyProvider(DataProvider):
     def get_macro_indicators(self, start_date: str | None = None, end_date: str | None = None) -> dict:
         return {
             "snapshot_at": "2026-02-16T00:00:00Z",
-            "source_policy": {"version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"},
+            "source_policy": {"version": MACRO_SOURCE_POLICY_VERSION},
             "series": {
                 "us_m2": {
                     "source": "fred:M2SL",

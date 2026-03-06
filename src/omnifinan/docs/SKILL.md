@@ -1,11 +1,11 @@
 ---
 name: omnifinan
-description: Guide AI to use the OmniFinan Python library for financial analysis, including multi-agent hedge fund workflow, data fetching (AkShare/YFinance/FRED/SEC EDGAR), macro indicators, technical/fundamental/sentiment/valuation analysis, bull-bear debate, risk management, portfolio decisions, backtesting, visualization, and report pipelines. Use when working with OmniFinan code, running analyses, modifying agents, or adding features to this financial analysis system.
+description: Guide AI to use the OmniFinan Python library for financial analysis, including multi-agent hedge fund workflow, data fetching (AkShare/YFinance/FRED/DBnomics/SEC EDGAR), macro indicators, technical/fundamental/sentiment/valuation analysis, bull-bear debate, risk management, portfolio decisions, backtesting, visualization, and report pipelines. Use when working with OmniFinan code, running analyses, modifying agents, or adding features to this financial analysis system.
 ---
 
 # OmniFinan Library Guide
 
-OmniFinan is an AI-driven multi-agent hedge fund analysis system supporting US and Chinese markets. It uses LangGraph for agent orchestration, LangChain for LLM calls, and multiple data providers (AkShare, YFinance, Finnhub, SEC EDGAR, FRED, World Bank).
+OmniFinan is an AI-driven multi-agent hedge fund analysis system supporting US, HK, China, and crypto workflows. It uses LangGraph for agent orchestration, LangChain for LLM calls, and multiple data providers (AkShare, YFinance, SEC EDGAR, FRED, World Bank, IMF Datamapper, DBnomics, Tavily, Brave).
 
 ## Project Structure
 
@@ -48,9 +48,8 @@ src/omnifinan/
 │       ├── factory.py       # create_data_provider(name)
 │       ├── akshare_provider.py
 │       ├── yfinance_provider.py
-│       ├── finnhub_provider.py
 │       ├── sec_edgar_provider.py
-│       └── marketdata_provider.py   # options-only provider
+│       └── moomoo_options_provider.py   # stock options provider
 ├── analysis/
 │   ├── indicators.py        # XMA, cross_over, cross_under (TA-Lib wrappers)
 │   ├── transform.py         # Feature engineering: returns, rolling features
@@ -105,7 +104,7 @@ Analyst agents (run in parallel after market_data_agent):
 - `technical_analyst_agent` - trend, momentum, mean reversion, volatility, stat arb
 - `fundamentals_agent` - profitability, growth, financial health, valuation ratios
 - `macro_analyst_agent` - central bank rates, inflation, employment
-- `sentiment_agent` - news keyword scoring + LLM sentiment analysis
+- `sentiment_agent` - news/inference-driven sentiment analysis node; data discovery is separate from `get_company_news`
 - `valuation_agent` - DCF, owner earnings, residual income, comparable multiples
 
 ### Data Providers
@@ -114,9 +113,17 @@ Analyst agents (run in parallel after market_data_agent):
 |----------|-------------|---------|-------------|
 | AkShare | `"akshare"` | CN, US, HK | Prices, financials, news, macro (CN+intl) |
 | YFinance | `"yfinance"`, `"yf"`, `"yahoo"` | US, global, crypto | Prices, financials, news |
-| Finnhub | `"finnhub"` | US | Prices, financials, news, insider trades |
 | SEC EDGAR | `"sec_edgar"`, `"sec"` | US | Financial metrics, line items from XBRL |
-| MarketData (options-only) | n/a (direct options APIs) | US stocks, futures options | Option chain fetch only |
+| DBnomics | n/a (API helper in `unified_api.py`) | Global macro | Macro time series catalog (providers/datasets/series). Use workflow: `/search` → `/datasets/{provider}/{dataset}` → fetch via `series_ids` or provider+dataset+dimensions. Avoid calling `/series` without selectors (can be slow/terminated). |
+| Moomoo (options-only) | `provider="moomoo"` | US stock/index options | Stock option chain fetch only |
+
+Ticker normalization includes volatility indices:
+- `VIX` / `.VIX` -> `^VIX`
+- `VVIX` / `.VVIX` -> `^VVIX`
+
+Default stock-options routing:
+- `auto` uses `moomoo`.
+- Futures option chain is explicit unavailable in the current provider stack.
 
 Create with: `create_data_provider("akshare")`
 
@@ -126,7 +133,7 @@ All providers implement:
 - `get_prices(ticker, start_date, end_date, interval) -> list[Price]`
 - `get_financial_metrics(ticker, end_date, period, limit) -> list[FinancialMetrics]`
 - `search_line_items(ticker, period, limit) -> list[LineItem]`
-- `get_company_news(ticker, start_date, end_date, limit) -> list[CompanyNews]`
+- `get_company_news_raw(ticker, start_date, end_date, limit) -> list[CompanyNews]`
 - `get_insider_trades(ticker, end_date, start_date, limit) -> list[InsiderTrade]`
 - `get_market_cap(ticker, end_date) -> float | None`
 - `get_macro_indicators(start_date, end_date) -> dict`
@@ -136,13 +143,21 @@ All providers implement:
 Wraps a `DataProvider` with intelligent caching via `DataCache`. Key behaviors:
 - **Price data**: Incremental fetch - backfills gaps, appends new data, avoids redundant downloads
 - **Financial metrics/line items**: Refetch when latest report is >30 days stale
-- **Macro indicators**: Master-first strategy with series-level staleness, subset refresh, anti-loop guard
-- **Company news**: Incremental forward/backward fetch, deduplicated by URL/title
+- **Macro indicators**: Master-first strategy with series-level staleness + subset refresh. When `force=False`, the service must **never auto full-refresh**; if subset refresh is unavailable or fails, it logs **ERROR** and continues with cached payload. Metrics explicitly retired from the active macro interface are removed from outputs rather than emitted as stale placeholders.
+- **Company news**:
+  - A-shares use AkShare raw news
+  - US/HK use Tavily-first and Brave supplemental search
+  - results are clustered into integrated events
+  - cross-verification uses actual publisher/domain weights, not search-engine counts
+
+Public API note:
+- `UnifiedDataService.get_company_news(...)` returns integrated news events
+- provider-layer `get_company_news_raw(...)` is internal raw discovery only
 - **Insider trades**: Incremental fetch by filing_date
 - **Crypto**: Auto-routes to YFinance for crypto tickers
 - **Options**:
-  - `get_stock_option_chain()` defaults to `provider="auto"` (MarketData first, then YFinance fallback)
-  - `get_futures_option_chain()` uses MarketData
+- `get_stock_option_chain()` defaults to `provider="auto"` (`moomoo`)
+- `get_futures_option_chain()` returns explicit unavailable in the current provider stack
   - default snapshot mode is previous-business-day close (`snapshot_mode="prev_close"`)
 
 ```python
@@ -164,7 +179,9 @@ fut_opts = service.get_futures_option_chain("ES", expiration="2026-06-19")
 
 ### Macro Data Architecture
 
-- Source policy: `fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank`
+- Source policy: `fixed_sources_with_dbnomics_proxies`
+- Data-source credentials: read from `OMNIX_PATH/finn_api.json`
+  - Recommended node keys: `FRED.api_key`, `tavily.api_key`, `brave.api_key`
 - Master payload stored as dataset with snapshot history
 - Staleness detection: per-series based on `cycle_days * 3` threshold
 - Refetch cooldown: `fetched_at` + frequency-based minimum interval
@@ -198,6 +215,10 @@ multi-agent orchestration:
 - `get_stock_option_chain`
 - `get_futures_option_chain`
 - `get_stock_option_chain_analytics` (new; non-LLM)
+- `get_stock_option_gex` (new; non-LLM; estimated GEX summary)
+  - supports `gex_expiration` (default `None`):
+    - `None` => full-chain GEX
+    - `YYYY-MM-DD` => GEX for that expiry only
 - `get_futures_option_chain_analytics` (new; non-LLM)
 
 ### Option Analytics (Non-LLM) Guidance
@@ -205,6 +226,8 @@ multi-agent orchestration:
 When the task asks for IV/skew/term-structure/Greeks, use analytics APIs first:
 
 - `UnifiedDataService.get_stock_option_chain_analytics(...)`
+  - `risk_free_rate` can be omitted; service resolves from macro yields (`us_treasury_2y` then `us_treasury_10y`) before fallback.
+  - `contract_multiplier` supports explicit override; default is 100.
 - `UnifiedDataService.get_futures_option_chain_analytics(...)`
 
 Market compatibility rule:
@@ -317,7 +340,8 @@ llm:
 | `Price` | open, close, high, low, volume, time, market |
 | `FinancialMetrics` | ticker, report_period, period, currency, market_cap, PE/PB/PS ratios, margins, ROE/ROA, growth rates |
 | `LineItem` | ticker, report_period, net_income, operating_revenue, free_cash_flow (extra="allow") |
-| `CompanyNews` | ticker, title, source, date, url, sentiment |
+| `CompanyNews` | provider-level raw article row: ticker, title, source, date, url |
+| `IntegratedNewsEvent` | event_id, ticker, headline, published_at, primary_source, weighted_source_score, consensus_passed |
 | `InsiderTrade` | ticker, filing_date, transaction_date, transaction_shares, transaction_value |
 | `MarketType` | US, CHINA, CHINA_SZ, CHINA_SH, HK, UNKNOWN |
 

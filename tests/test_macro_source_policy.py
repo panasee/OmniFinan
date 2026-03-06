@@ -4,10 +4,12 @@ import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import omnifinan.unified_api as unified_api
 from omnifinan.data.cache import DataCache
 from omnifinan.data.providers.base import DataProvider
 from omnifinan.data.unified_service import UnifiedDataService
 from omnifinan.data_models import CompanyNews, FinancialMetrics, InsiderTrade, LineItem, Price
+from omnifinan.unified_api import MACRO_SOURCE_POLICY_VERSION
 
 
 class _MacroDummyProvider(DataProvider):
@@ -31,7 +33,7 @@ class _MacroDummyProvider(DataProvider):
     def search_line_items(self, ticker: str, period: str = "ttm", limit: int = 10) -> list[LineItem]:
         return []
 
-    def get_company_news(
+    def get_company_news_raw(
         self,
         ticker: str,
         start_date: str | None = None,
@@ -64,7 +66,7 @@ class _MacroDummyProvider(DataProvider):
             },
             "latest": {"fed_policy_rate": 5.0},
             "snapshot_at": "2026-02-15T00:00:00Z",
-            "source_policy": {"version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"},
+            "source_policy": {"version": MACRO_SOURCE_POLICY_VERSION},
             "_args": {"start_date": start_date, "end_date": end_date},
         }
 
@@ -114,10 +116,73 @@ def test_macro_source_policy_cache_and_history(tmp_path: Path):
     assert one["latest"]["fed_policy_rate"] == 5.0
     assert two["latest"]["fed_policy_rate"] == 5.0
 
-    dataset_key = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank__master"
+    dataset_key = f"{MACRO_SOURCE_POLICY_VERSION}__master"
     history = service.cache.get_dataset("macro_indicators_history", dataset_key)
     assert isinstance(history, list)
     assert len(history) == 1
+
+
+def test_macro_deprecated_policy_caches_are_detached_on_active_calls(tmp_path: Path):
+    provider = _MacroDummyProvider()
+    service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
+
+    for deprecated_version in (
+        "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "fixed_sources_v2_with_dbnomics_proxies",
+    ):
+        service.cache.set(
+            "macro_indicators",
+            {"scope": "master", "source_policy_version": deprecated_version},
+            {"legacy": True},
+        )
+        service.cache.set(
+            "macro_indicators_structured",
+            {
+                "start_date": "2025-01-01",
+                "end_date": "2026-12-31",
+                "source_policy_version": deprecated_version,
+                "view": "structured_v1",
+            },
+            {"legacy": True},
+        )
+        service.cache.set_dataset(
+            "macro_indicators_history",
+            f"{deprecated_version}__master",
+            [{"legacy": True}],
+        )
+
+    _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
+
+    for deprecated_version in (
+        "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "fixed_sources_v2_with_dbnomics_proxies",
+    ):
+        assert (
+            service.cache.get(
+                "macro_indicators",
+                {"scope": "master", "source_policy_version": deprecated_version},
+            )
+            is None
+        )
+        assert (
+            service.cache.get(
+                "macro_indicators_structured",
+                {
+                    "start_date": "2025-01-01",
+                    "end_date": "2026-12-31",
+                    "source_policy_version": deprecated_version,
+                    "view": "structured_v1",
+                },
+            )
+            is None
+        )
+        assert (
+            service.cache.get_dataset(
+                "macro_indicators_history",
+                f"{deprecated_version}__master",
+            )
+            is None
+        )
 
 
 def test_macro_refresh_when_series_latest_date_is_stale(tmp_path: Path):
@@ -126,7 +191,7 @@ def test_macro_refresh_when_series_latest_date_is_stale(tmp_path: Path):
 
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -156,7 +221,7 @@ def test_macro_refresh_when_cache_has_errors_even_if_fresh(tmp_path: Path):
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -175,7 +240,7 @@ def test_macro_refresh_when_cache_has_errors_even_if_fresh(tmp_path: Path):
     )
 
     _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2025-12-31")
-    assert provider.calls == 1
+    assert provider.calls == 0
 
 
 def test_macro_window_is_subset_of_master(tmp_path: Path):
@@ -184,7 +249,7 @@ def test_macro_window_is_subset_of_master(tmp_path: Path):
 
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -216,7 +281,7 @@ def test_macro_restores_request_cache_from_dataset_master(tmp_path: Path):
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
 
     today = date.today().strftime("%Y-%m-%d")
-    dataset_key = "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank__master"
+    dataset_key = f"{MACRO_SOURCE_POLICY_VERSION}__master"
     snapshot = {
         "series": {
             "fed_policy_rate": {
@@ -239,7 +304,7 @@ def test_macro_refreshes_only_missing_series_when_subset_supported(tmp_path: Pat
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -277,7 +342,7 @@ def test_macro_skips_refetch_when_recently_fetched(tmp_path: Path):
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -315,7 +380,7 @@ def test_macro_refetches_when_fetched_at_is_old(tmp_path: Path):
     old_fetch = (datetime.now() - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%S")
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -346,7 +411,7 @@ def test_macro_error_series_with_recent_fetched_at_not_refetched(tmp_path: Path)
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -429,7 +494,7 @@ class _MacroPartialErrorProvider(_MacroDummyProvider):
             },
             "latest": {"fed_policy_rate": 5.25, "china_lpr_1y": None},
             "snapshot_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "source_policy": {"version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank"},
+            "source_policy": {"version": MACRO_SOURCE_POLICY_VERSION},
         }
 
 
@@ -439,7 +504,7 @@ def test_macro_when_provider_raises_returns_existing_cache(tmp_path: Path):
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     existing = {
         "series": {
@@ -472,42 +537,42 @@ def test_macro_when_provider_raises_returns_existing_cache(tmp_path: Path):
 
 
 def test_macro_when_subset_and_full_both_raise_returns_existing(tmp_path: Path):
-    """Subset 拉取异常后 fallback 全量，全量也异常时，仍返回已有缓存，不丢失本地数据。"""
+    """Subset 拉取异常时仍返回已有缓存；非 force 模式下不自动回退全量刷新。"""
     provider = _MacroSubsetRaisingProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     existing = {
         "series": {
-            "china_cpi_yoy": {
+            "china_cpi_mom": {
                 "latest": {"date": "2025-06-15", "value": 0.8},
                 "observations": [{"date": "2025-06-15", "value": 0.8}],
-                "source": "akshare:china_official:nbs",
+                "source": "dbnomics:NBS/M_A01030G/A01030G01",
                 "error": None,
                 "fetched_at": (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S"),
             },
         },
-        "latest": {"china_cpi_yoy": 0.8},
+        "latest": {"china_cpi_mom": 0.8},
         "snapshot_at": "2025-06-15T00:00:00Z",
     }
     service.cache.set("macro_indicators", params, existing)
 
     out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-02-28")
-    assert out["latest"]["china_cpi_yoy"] == 0.8
-    assert out["series"]["china_cpi_yoy"]["observations"]
+    assert out["latest"]["china_cpi_mom"] == 0.8
+    assert out["series"]["china_cpi_mom"]["observations"]
     assert provider.subset_calls == 1
-    assert provider.calls == 1
+    assert provider.calls == 0
 
 
 def test_macro_merge_preserves_existing_when_incoming_has_error_for_series(tmp_path: Path):
-    """Merge 时若某 series 本次拉取为 error/空，应保留本地已有该 series 的数据，不重复拉取覆盖。"""
+    """强制刷新时若某 series 本次拉取为 error/空，应保留本地已有该 series 的数据。"""
     provider = _MacroPartialErrorProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     existing = {
         "series": {
@@ -533,7 +598,7 @@ def test_macro_merge_preserves_existing_when_incoming_has_error_for_series(tmp_p
         existing["series"][key]["fetched_at"] = old_fetched
     service.cache.set("macro_indicators", params, existing)
 
-    out = service.get_macro_indicators(start_date="2026-01-01", end_date="2026-02-28")
+    out = service.get_macro_indicators(start_date="2026-01-01", end_date="2026-02-28", force=True)
     merged = out["series"]
     assert merged["fed_policy_rate"]["latest"]["value"] == 5.25
     assert merged["fed_policy_rate"]["observations"]
@@ -550,7 +615,7 @@ def test_macro_no_full_fetch_when_cache_fresh_and_complete(tmp_path: Path):
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     params = {
         "scope": "master",
-        "source_policy_version": "fixed_sources_v1_china_akshare_official__intl_fred_imf_worldbank",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
     }
     service.cache.set(
         "macro_indicators",
@@ -581,3 +646,97 @@ def test_macro_no_full_fetch_when_cache_fresh_and_complete(tmp_path: Path):
     assert provider.calls == 0
     assert out["latest"]["fed_policy_rate"] == 5.0
     assert out["latest"]["sofr"] == 4.3
+
+
+def test_macro_replacements_use_dbnomics_and_fred_sources(monkeypatch):
+    def fake_dbnomics_fetch_series(
+        *,
+        series_name: str,
+        provider_code: str,
+        dataset_code: str,
+        series_code: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        return {
+            "series": series_name,
+            "source": f"dbnomics:{provider_code}/{dataset_code}/{series_code}",
+            "observations": [
+                {"date": "2025-11-01", "value": 101.5},
+                {"date": "2025-12-01", "value": 102.5},
+            ],
+            "latest": {"date": "2025-12-01", "value": 102.5},
+            "previous": {"date": "2025-11-01", "value": 101.5},
+            "trend": "up",
+            "error": None,
+            "fetched_at": "2026-03-06T00:00:00",
+        }
+
+    def fake_fred_fetch_series(
+        *,
+        series_name: str,
+        series_id: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        transform: str | None = None,
+    ) -> dict:
+        return {
+            "series": series_name,
+            "source": f"fred:{series_id}",
+            "observations": [{"date": "2026-01-01", "value": 60.0}],
+            "latest": {"date": "2026-01-01", "value": 60.0},
+            "previous": None,
+            "trend": "flat",
+            "error": None,
+            "fetched_at": "2026-03-06T00:00:00",
+        }
+
+    monkeypatch.setattr(unified_api, "_dbnomics_fetch_series", fake_dbnomics_fetch_series)
+    monkeypatch.setattr(unified_api, "_fred_fetch_series", fake_fred_fetch_series)
+
+    payload = unified_api.get_macro_indicators(
+        include_series=["china_cpi_mom", "china_ppi_yoy", "us_consumer_confidence_cb"]
+    )
+
+    assert payload["series"]["china_cpi_mom"]["source"] == "dbnomics:NBS/M_A01030G/A01030G01"
+    assert payload["series"]["china_cpi_mom"]["latest"]["value"] == 2.5
+    assert payload["series"]["china_ppi_yoy"]["source"] == "dbnomics:NBS/M_A010801/A01080101"
+    assert payload["series"]["china_ppi_yoy"]["latest"]["value"] == 2.5
+    assert payload["series"]["us_consumer_confidence_cb"]["source"] == "fred:USACSCICP02STSAM"
+
+
+def test_retired_macro_series_are_pruned_from_cached_payload(tmp_path: Path):
+    provider = _MacroDummyProvider()
+    service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
+    params = {
+        "scope": "master",
+        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
+    }
+    service.cache.set(
+        "macro_indicators",
+        params,
+        {
+            "series": {
+                "fed_policy_rate": {
+                    "latest": {"date": "2026-02-01", "value": 5.0},
+                    "observations": [{"date": "2026-02-01", "value": 5.0}],
+                    "source": "fred:FEDFUNDS",
+                    "error": None,
+                    "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                },
+                "china_cpi_yoy": {
+                    "latest": {"date": "2025-08-09", "value": 0.0},
+                    "observations": [{"date": "2025-08-09", "value": 0.0}],
+                    "source": "akshare:china_official:nbs",
+                    "error": None,
+                    "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                },
+            },
+            "latest": {"fed_policy_rate": 5.0, "china_cpi_yoy": 0.0},
+            "snapshot_at": "2026-02-01T00:00:00Z",
+        },
+    )
+
+    out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
+    assert "china_cpi_yoy" not in out["series"]
+    assert "china_cpi_yoy" not in out["latest"]

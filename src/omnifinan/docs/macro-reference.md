@@ -1,5 +1,7 @@
 # Macro Data Reference
 
+Active runtime policy: `fixed_sources_with_dbnomics_proxies`
+
 ## Series Keys by Country and Source
 
 ### US (FRED)
@@ -34,8 +36,8 @@
 | `us_bank_loan_growth_yoy` | derived BUSLOANS | Bank Loan Growth YoY |
 | `us_equity_sp500` | SP500 | S&P 500 Index |
 | `us_vix` | VIXCLS | VIX Volatility Index |
-| `us_dollar_index_broad` | DTWEXBGS | US Dollar Index (Broad) |
-| `commodity_wti_crude` | DCOILWTICO | WTI Crude Oil |
+| `us_dollar_index_broad` | yfinance `DX-Y.NYB` | US Dollar Index (Broad) |
+| `commodity_wti_crude` | yfinance `CL=F` | WTI Crude Oil |
 | `commodity_copper` | PCOPPUSDM | Copper Price |
 
 ### US (AkShare)
@@ -43,27 +45,25 @@
 | Key | AkShare Function | Description |
 |-----|-----------------|-------------|
 | `us_consumer_confidence_cb` | macro_usa_cb_consumer_confidence | CB Consumer Confidence |
-| `us_consumer_sentiment_michigan` | macro_usa_michigan_consumer_sentiment | Michigan Consumer Sentiment |
+| `us_consumer_sentiment_michigan` | FRED `UMCSENT` | Michigan Consumer Sentiment |
 | `us_pmi_manufacturing` | macro_usa_ism_pmi (+ local fallback) | ISM Manufacturing PMI |
 | `us_pmi_services` | macro_usa_ism_non_pmi (+ local fallback) | ISM Services PMI |
 
-### China (AkShare Official)
+### China (Official + Fixed Proxies)
 
 | Key | Source | Description |
 |-----|--------|-------------|
 | `pboc_policy_rate` | PBOC | Policy benchmark rate (fallback to LPR 1Y) |
 | `china_lpr_1y` | PBOC | Loan Prime Rate 1Y |
 | `china_shibor_3m` | CFETS | SHIBOR 3-Month |
-| `china_cpi_yoy` | NBS | CPI Year-over-Year |
-| `china_cpi_mom` | NBS | CPI Month-over-Month |
+| `china_cpi_mom` | DBnomics NBS/M_A01030G/A01030G01 | CPI Month-over-Month |
 | `china_ppi_yoy` | NBS | PPI Year-over-Year |
 | `china_gdp_yoy` | NBS | GDP Year-over-Year |
-| `china_pmi_manufacturing` | NBS | Official Manufacturing PMI |
-| `china_caixin_pmi_manufacturing` | Caixin | Caixin Manufacturing PMI |
-| `china_caixin_pmi_services` | Caixin | Caixin Services PMI |
+| `china_pmi_manufacturing` | DBnomics NBS/M_A0B01/A0B0101 | Official Manufacturing PMI |
+| `china_pmi_services` | DBnomics NBS/M_A0B02/A0B020C | Official Services PMI |
 | `china_pmi_non_manufacturing` | NBS | Non-Manufacturing PMI |
 | `china_urban_unemployment` | NBS | Urban Unemployment Rate |
-| `china_m2_yoy` | PBOC | M2 Growth Year-over-Year |
+| `china_m2_yoy` | DBnomics NBS/M_A0D01/A0D0102 | M2 Growth Year-over-Year |
 | `china_social_financing` | PBOC | Total Social Financing |
 | `china_bank_financing` | PBOC | Bank Financing |
 | `china_central_bank_balance_sheet` | PBOC | Central Bank Balance Sheet |
@@ -71,11 +71,9 @@
 | `china_real_estate_financing` | NBS | Real Estate Development Financing |
 | `china_fixed_asset_investment_yoy` | NBS | Fixed Asset Investment YoY |
 | `china_retail_sales_yoy` | NBS | Retail Sales YoY |
-| `china_industrial_production_yoy` | NBS | Industrial Production YoY |
 | `china_exports_yoy` | Customs | Exports YoY |
-| `china_imports_yoy` | Customs | Imports YoY |
 | `china_trade_balance` | Customs | Trade Balance |
-| `china_fx_reserves` | SAFE | FX Reserves |
+| `china_fx_reserves` | DBnomics IMF/IFS:RAXGFX_USD:CN | FX Reserves |
 
 ### Singapore (World Bank + FRED)
 
@@ -90,7 +88,7 @@
 | `sg_real_interest_rate` | World Bank | FR.INR.RINR / FR.INR.LNDP |
 | `sg_broad_money_growth` | World Bank | FM.LBL.BMNY.ZG |
 | `sg_policy_rate` | World Bank | FR.INR.DPST / FR.INR.LEND |
-| `sg_usd_fx` | FRED | DEXSIUS |
+| `sg_usd_fx` | yfinance `SGD=X` | SGD/USD FX |
 | `sg_government_bond_10y` | MAS SGS | 10Y Original Maturity |
 
 ### Japan / Europe Cross-Impact
@@ -99,12 +97,12 @@
 |-----|---------|-------------|
 | `jp_short_rate_3m` | IR3TIB01JPM156N | Japan 3M Interbank |
 | `jp_government_bond_10y` | IRLTLT01JPM156N | Japan 10Y JGB |
-| `jp_usd_fx` | DEXJPUS | USD/JPY |
+| `jp_usd_fx` | yfinance `JPY=X` | USD/JPY |
 | `jp_policy_rate` | AkShare macro_japan_bank_rate | BoJ Policy Rate |
 | `eu_short_rate_3m` | IR3TIB01EZM156N | Eurozone 3M Interbank |
 | `eu_government_bond_10y` | IRLTLT01EZM156N | Eurozone 10Y Bond |
-| `eu_usd_fx` | DEXUSEU | EUR/USD |
-| `eu_pmi_manufacturing` | AkShare macro_euro_manufacturing_pmi | Euro Mfg PMI |
+| `eu_usd_fx` | yfinance `EURUSD=X` | EUR/USD |
+| `eu_industrial_confidence_indicator` | DBnomics Eurostat/EI_BSSI_M_R2/M.BS-ICI-BAL.SA.EA20 | Euro Area Industrial Confidence Indicator |
 
 ### Global Aggregates (World Bank)
 
@@ -120,7 +118,7 @@ Each series maps to one of 5 analytical dimensions:
 | Dimension | Description | Example Keys |
 |-----------|-------------|-------------|
 | `growth` | Economic output and activity | us_real_gdp_yoy, china_gdp_yoy, china_pmi_manufacturing |
-| `inflation` | Price level and expectations | us_cpi_yoy, china_cpi_yoy, us_breakeven_10y |
+| `inflation` | Price level and expectations | us_cpi_yoy, china_cpi_mom, us_breakeven_10y |
 | `liquidity` | Money supply, rates, FX | fed_policy_rate, sofr, china_shibor_3m, us_m2 |
 | `credit` | Lending, spreads, delinquency | us_corporate_bbb_oas, china_social_financing |
 | `market_feedback` | Asset prices and volatility | us_equity_sp500, us_vix, commodity_wti_crude |
@@ -150,7 +148,7 @@ Staleness check priority:
 {
     "meta": {
         "snapshot_at": "2025-06-15T12:00:00Z",
-        "source_policy": "fixed_sources_v1_...",
+        "source_policy": "fixed_sources_with_dbnomics_proxies",
         "series_count": 60,
         "ok_count": 55,
         "error_count": 5,
