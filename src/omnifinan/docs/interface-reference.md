@@ -53,6 +53,7 @@ For non-LLM analytics tasks, prefer direct `UnifiedDataService` APIs:
 Use first when tasks request IV/skew/term-structure/Greeks:
 - `UnifiedDataService.get_stock_option_chain_analytics(...)`
 - `UnifiedDataService.get_futures_option_chain_analytics(...)`
+- `UnifiedDataService.get_stock_option_gex(...)`
 
 Market compatibility:
 - China A-share / HK equity tickers currently have no options support in provider stack.
@@ -80,6 +81,23 @@ Return contract:
 - `analytics.summary.iv_historical_percentile` (requires `iv_history` input)
 - `analytics.errors` (explicit calculation issues)
 
+IV normalization rule:
+- Provider `iv` fields may arrive as percentage points (for example `87.4` meaning `87.4%`).
+- Analytics normalizes chain-level provider IV inputs to Black-Scholes decimal volatility before Greeks/GEX calculation.
+- `analytics.surface[*].iv`, `median_iv`, ATM IV, skew, smile, and GEX all use normalized decimal IV.
+
+`get_stock_option_gex(...)` notes:
+- `expiration=YYYY-MM-DD` restricts provider fetch to one expiry when supported.
+- `gex_expiration` overrides `expiration` for GEX-only calls.
+- `exp_date` supports post-fetch expiry bucket filters:
+  - `all`
+  - `0dte`
+  - `7dte` / `14dte` / any `Ndte` token (resolved to nearest available DTE bucket)
+  - `monthly` (nearest third-Friday monthly expiry)
+  - `quarterly` (nearest third-Friday in Mar/Jun/Sep/Dec)
+  - tokens can be combined with `+`, e.g. `7dte+monthly`
+- `gex_data.metadata.gamma_flip_price` is only populated when net GEX crosses zero inside the internal spot sweep band (`0.7x` to `1.3x` current spot). Otherwise it remains `null`.
+
 ## Orchestration Interfaces
 
 These remain supported when task intent is end-to-end orchestration:
@@ -89,6 +107,47 @@ These remain supported when task intent is end-to-end orchestration:
 - `omnifinan.presentation.api.create_app()`
 - `omnifinan.visualize.StockFigure`
 - `omnifinan.visualize.create_macro_figure`
+
+## Factor Mining and Backtest Interfaces
+
+Quantitative factor pipeline for cross-sectional alpha research.
+
+### Factor Mining (`analysis/factor_mining.py`)
+
+| Function | Purpose |
+|----------|---------|
+| `add_candidate_factors(df, forward_horizon=5)` | Generate 9 built-in technical factors + forward return label |
+| `zscore_by_date(df, factor_cols)` | Cross-sectional z-score normalization per date |
+| `daily_ic(frame, factor_col, label_col, method)` | Daily IC time series (pearson or spearman) |
+| `evaluate_factors(frame, factor_cols, label_col)` | IC/RankIC summary report for multiple factors |
+| `apply_custom_factor(df, name, func, group_col, sort_col, kwargs)` | Apply single custom factor |
+| `apply_custom_factors(df, factors)` | Apply multiple custom factors (Sequence[CustomFactorSpec] or dict) |
+
+Input contract: DataFrame with `[date, symbol, close, high, low, volume]` columns.
+
+Output of `evaluate_factors`:
+- `factor`, `ic_mean`, `ic_std`, `ic_ir`, `rank_ic_mean`, `rank_ic_std`, `rank_ic_ir`, `obs_days`
+- Sorted by `rank_ic_mean` descending.
+
+Dependency: `scipy` required for Spearman rank correlation.
+
+### Factor Backtest (`analysis/factor_backtest.py`)
+
+| Function | Purpose |
+|----------|---------|
+| `build_cross_sectional_weights(frame, score_col, quantile, long_short)` | Daily target weights from factor ranks |
+| `run_daily_backtest(frame, weights, cost_rate)` | Daily backtest with 1-day signal delay + transaction costs |
+| `perf_stats(ret, equity)` | Standard performance statistics |
+
+Output of `run_daily_backtest`: DataFrame with `gross_ret`, `cost`, `net_ret`, `turnover`, `equity`, `drawdown`, `bench_ret`, `bench_equity`.
+
+Output of `perf_stats`: `total_return`, `annual_return`, `annual_vol`, `sharpe`, `max_drawdown`, `win_rate`.
+
+### Qlib-Style Factor DSL (`research/factors.py`)
+
+Primitives: `ref(s, n)`, `mean(s, n)`, `std(s, n)`, `rank(s, n)`.
+
+String expression interface: `apply_factor("Ref($close,1)", df)` — supports `Ref`, `Mean`, `Std`, `Rank`.
 
 ## Compatibility Rules
 

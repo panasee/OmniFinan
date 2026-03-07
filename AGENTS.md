@@ -24,9 +24,9 @@ It reflects current code behavior, especially macro data sourcing, cache semanti
 - `OMNIX_PATH/omnifinan/datasets/macro_indicators_history/fixed_sources_with_dbnomics_proxies__master.json`
 
 ## Macro Cache and Refresh Rules
-- `UnifiedDataService.get_macro_indicators` is master-first:
-- use request cache first;
-- if missing, restore from latest dataset master snapshot;
+- `UnifiedDataService.get_macro_indicators` is datasets-first:
+- master payload stored directly in `datasets/macro_indicators_master/`;
+- **not** stored in `request_cache/` (immune to TTL-based `cleanup_expired`);
 - query windows are filtered subsets of one master payload.
 - Stale policy is series-level:
 - threshold = `3 * inferred_cycle_days`;
@@ -62,6 +62,10 @@ After macro logic changes, run:
 - `pytest tests/test_macro_source_policy.py`
 - `pytest tests/test_macro_structured.py`
 - `pytest tests/test_macro_visualize.py`
+
+After factor mining / backtest changes, run:
+- `pytest tests/test_factor_mining.py`
+- `pytest tests/test_factor_backtest.py`
 
 ## Typical Macro Usage
 1. `get_macro_indicators(start_date, end_date)`

@@ -35,6 +35,7 @@ Never stop the full workflow only because one feed is missing. Mark gaps explici
 
 Primary:
 - `UnifiedDataService.get_stock_option_chain_analytics(...)`
+- `UnifiedDataService.get_stock_option_gex(...)`
 - `UnifiedDataService.get_futures_option_chain_analytics(...)`
 - `UnifiedDataService.get_macro_indicators(...)` (includes `us_vix`)
 - `UnifiedDataService.get_company_news(...)`
@@ -43,6 +44,11 @@ Primary:
 Notes:
 - A-share/HK equities: stock options unsupported in current provider stack; expect explicit unavailable payload.
 - Crypto options routing is normalized to base (`BTC-USDT` -> `BTC`, `ETH-USD` -> `ETH`) in current code.
+- Index option aliases supported by current provider path:
+  - `.SPX`, `SPX`, `^SPX`, `SPXW` -> `US..SPX`
+- For market-regime work, treat `.SPX` and `GLD` as preferred GEX watchlist symbols:
+  - `.SPX` / `US..SPX`: broad equity index dealer positioning and volatility amplification / damping
+  - `GLD`: gold / defensive-flow positioning and macro stress hedge behavior
 
 ### 2.3 Missing-data fallback rules
 
@@ -51,6 +57,9 @@ If OmniFinan lacks required data:
   - search official exchange/data pages or high-quality market data providers
 - Breadth:
   - search index constituents + EOD prices to compute `% above MA200`
+- SPX / GLD GEX:
+  - if `.SPX` / `US..SPX` or `GLD` option chain is unavailable, mark GEX path as partial and continue
+  - do not silently substitute unrelated underlyings
 - Block flow:
   - use institution/block trade summaries when available; otherwise clearly mark as proxy/unavailable
 - News KG:
@@ -62,11 +71,15 @@ If OmniFinan lacks required data:
 
 Inputs:
 - option analytics payload (`analytics.summary`, `skew_by_expiry`, `term_structure`, `smile_by_expiry`, `implied_vs_realized`)
+- GEX payloads for:
+  - `.SPX` / `US..SPX` (preferred broad-market index positioning)
+  - `GLD` (preferred defensive / hedge-asset positioning)
 - VIX level series
 - (optional) VIX futures front/next term structure (external fallback)
 
 Data-quality guardrail:
 - For index options, ensure `underlying_price` is sourced from explicit quote fields (`underlyingPrice` / provider meta) before trusting analytics; strike-median fallback should be treated as degraded mode.
+- For `.SPX` / `US..SPX`, treat provider unavailability as a known operational risk; continue with available paths rather than aborting the market regime workflow.
 
 Compute:
 - `RR25` = `risk_reversal_25d`
@@ -75,6 +88,18 @@ Compute:
 - term state proxy: contango/backwardation (if futures available)
 - `vvix_vix_ratio` (if VVIX available)
 - `gamma_regime` (if net-GEX estimate available)
+- `.SPX` GEX diagnostics when available:
+  - `net_gex_nominal`
+  - `gamma_flip_price`
+  - `call_wall`
+  - `put_wall`
+  - `gamma_purity`
+- `GLD` GEX diagnostics when available:
+  - `net_gex_nominal`
+  - `gamma_flip_price`
+  - `call_wall`
+  - `put_wall`
+  - compare direction vs `.SPX` to detect hedge-demand divergence
 
 Signal logic:
 - High positive crash-hedge demand: deep negative RR25 / steep put wing -> risk aversion
@@ -82,6 +107,16 @@ Signal logic:
 - Futures curve flips to backwardation -> strong risk_off flag
 - VIX low but VVIX rising (ratio uptrend) -> tail-risk early warning
 - Negative gamma regime -> volatility amplification risk
+- `.SPX` GEX interpretation:
+  - negative `.SPX` net GEX -> index volatility amplification risk
+  - `.SPX` spot near `gamma_flip_price` -> regime transition watch
+  - concentrated `.SPX` call/put walls -> pin or breakout pressure zones
+- `GLD` GEX interpretation:
+  - rising positive `GLD` call-side pressure with weak `.SPX` GEX can indicate defensive rotation / hedge demand
+  - strong `GLD` downside-gamma alongside weak equities can confirm macro stress rather than isolated equity weakness
+- cross-asset divergence:
+  - `.SPX` negative gamma + `GLD` supportive / positive positioning -> stronger risk_off confirmation
+  - `.SPX` stabilizing gamma + weak `GLD` hedge demand -> supports risk_on / panic-fade interpretation
 - Total pressure scale + purity:
   - `total_abs_gex = sum(abs(gex_row))` captures total hedge pressure magnitude.
   - `gamma_purity = net_gex_nominal / total_abs_gex` captures directional purity vs cancellation.
@@ -180,7 +215,16 @@ Produce:
 {
   "as_of": "YYYY-MM-DD",
   "data_cutoff_time": "YYYY-MM-DDTHH:mm:ssZ",
+  "analysis_type": "market_sentiment",
+  "subject": {
+    "universe": ["SPY", "QQQ"]
+  },
   "universe": ["SPY", "QQQ"],
+  "summary": {
+    "primary_call": "risk_on|neutral|risk_off",
+    "confidence": 0.0,
+    "top_driver": "option_implied|news_diffusion|breadth_flow|null"
+  },
   "regime": "risk_on|neutral|risk_off",
   "confidence": 0.0,
   "top_driver": "option_implied|news_diffusion|breadth_flow|null",
@@ -194,7 +238,21 @@ Produce:
       "vvix_level": null,
       "vvix_vix_ratio": null,
       "gamma_regime": "positive_gamma|negative_gamma|unknown",
-      "vix_term_state": "contango|backwardation|unknown"
+      "vix_term_state": "contango|backwardation|unknown",
+      "spx_gex": {
+        "symbol": ".SPX|US..SPX",
+        "net_gex_nominal": null,
+        "gamma_flip_price": null,
+        "call_wall": null,
+        "put_wall": null
+      },
+      "gld_gex": {
+        "symbol": "GLD",
+        "net_gex_nominal": null,
+        "gamma_flip_price": null,
+        "call_wall": null,
+        "put_wall": null
+      }
     },
     "news_diffusion": {
       "lambda": 0.3,
@@ -209,9 +267,28 @@ Produce:
       "divergence_flags": []
     }
   },
-  "risk_flags": [],
-  "missing_data": [],
-  "sources": []
+  "risk_flags": [
+    {
+      "code": "tail_risk_warning",
+      "severity": "low|medium|high",
+      "message": ""
+    }
+  ],
+  "missing_data": [
+    {
+      "field": "signals.option_implied.spx_gex",
+      "reason": "",
+      "impact": "low|medium|high"
+    }
+  ],
+  "sources": [
+    {
+      "name": "omnifinan",
+      "type": "internal|external|proxy",
+      "target": "US..SPX",
+      "note": ""
+    }
+  ]
 }
 ```
 
@@ -243,4 +320,3 @@ python scripts/openclaw_market_math.py --mode demo
 5. Keep outputs deterministic and structured.
 6. Always emit `data_cutoff_time` and align option/news/breadth snapshots to avoid time-misalignment bias.
 7. If option data is unsupported for the target universe, use explicit proxy map (e.g., index options) and annotate in `missing_data` / `sources`.
-

@@ -53,8 +53,9 @@ src/omnifinan/
 ├── analysis/
 │   ├── indicators.py        # XMA, cross_over, cross_under (TA-Lib wrappers)
 │   ├── transform.py         # Feature engineering: returns, rolling features
-│   ├── factor_mining.py     # CustomFactorSpec, IC evaluation
-│   └── factor_backtest.py   # Cross-sectional factor backtesting
+│   ├── options.py           # BS pricing, IV, Greeks, max pain, OI levels, GEX, term structure, skew
+│   ├── factor_mining.py     # CustomFactorSpec, add_candidate_factors, IC/RankIC evaluation
+│   └── factor_backtest.py   # Cross-sectional factor backtesting, perf_stats
 ├── research/
 │   ├── valuation.py         # dcf_intrinsic_value(), valuation_signal()
 │   ├── factors.py           # Qlib-style DSL: ref, mean, std, rank, apply_factor
@@ -143,7 +144,7 @@ All providers implement:
 Wraps a `DataProvider` with intelligent caching via `DataCache`. Key behaviors:
 - **Price data**: Incremental fetch - backfills gaps, appends new data, avoids redundant downloads
 - **Financial metrics/line items**: Refetch when latest report is >30 days stale
-- **Macro indicators**: Master-first strategy with series-level staleness + subset refresh. When `force=False`, the service must **never auto full-refresh**; if subset refresh is unavailable or fails, it logs **ERROR** and continues with cached payload. Metrics explicitly retired from the active macro interface are removed from outputs rather than emitted as stale placeholders.
+- **Macro indicators**: Datasets-first strategy (stored in `datasets/macro_indicators_master/`, immune to TTL-based `cleanup_expired`). Uses series-level staleness + subset refresh. When `force=False`, the service must **never auto full-refresh**; if subset refresh is unavailable or fails, it logs **ERROR** and continues with cached payload. Metrics explicitly retired from the active macro interface are removed from outputs rather than emitted as stale placeholders.
 - **Company news**:
   - A-shares use AkShare raw news
   - US/HK use Tavily-first and Brave supplemental search
@@ -196,6 +197,95 @@ fut_opts = service.get_futures_option_chain("ES", expiration="2026-06-19")
 - `metrics`: per-series cards with yoy, mom, qoq, trend_short, trend_medium, volatility
 - `chart_data.long`: flattened list for plotting
 
+## Factor Mining Framework
+
+Quantitative factor mining pipeline inspired by qlib. Supports the full cycle: factor creation -> IC evaluation -> cross-sectional backtest.
+
+### Dependencies
+
+- `scipy` is required for Spearman Rank IC computation (`evaluate_factors`).
+
+### Built-in Factor Generation
+
+```python
+from omnifinan.analysis.factor_mining import add_candidate_factors
+
+# Input: panel DataFrame with columns [date, symbol, close, high, low, volume]
+factored = add_candidate_factors(panel, forward_horizon=5)
+# Adds: ret_1, ret_5, ret_20, mom_ma_5_20, mom_ma_20_60,
+#        volatility_20, amplitude_1, vol_ratio_20, rev_5, fwd_ret_5
+```
+
+### Cross-Sectional Z-Score
+
+```python
+from omnifinan.analysis.factor_mining import zscore_by_date
+
+zscored, z_cols = zscore_by_date(factored, ["ret_5", "mom_ma_5_20"])
+# z_cols = ["ret_5_z", "mom_ma_5_20_z"]
+```
+
+### IC Evaluation
+
+```python
+from omnifinan.analysis.factor_mining import evaluate_factors, daily_ic
+
+# Full report: IC mean/std/IR + Rank IC mean/std/IR for each factor
+report = evaluate_factors(zscored, z_cols, label_col="fwd_ret_5")
+
+# Single factor IC time series
+ic_ts = daily_ic(zscored, "ret_5_z", label_col="fwd_ret_5", method="spearman")
+```
+
+### Custom Factors
+
+```python
+from omnifinan.analysis.factor_mining import apply_custom_factors, CustomFactorSpec
+
+def rolling_sharpe(g, window=20):
+    ret = g["close"].pct_change()
+    return ret.rolling(window).mean() / ret.rolling(window).std()
+
+specs = [
+    CustomFactorSpec(name="sharpe_20", func=rolling_sharpe, kwargs={"window": 20}),
+]
+extended = apply_custom_factors(factored, specs)
+
+# Or dict shorthand:
+extended = apply_custom_factors(factored, {"ret_3": lambda g: g["close"].pct_change(3)})
+```
+
+### Factor Backtest
+
+```python
+from omnifinan.analysis.factor_backtest import (
+    build_cross_sectional_weights, run_daily_backtest, perf_stats,
+)
+
+weights = build_cross_sectional_weights(
+    df, score_col="mom_ma_20_60_z", quantile=0.2, long_short=True,
+)
+bt = run_daily_backtest(df, weights, cost_rate=0.001)
+stats = perf_stats(bt["net_ret"], bt["equity"])
+# Returns: total_return, annual_return, annual_vol, sharpe, max_drawdown, win_rate
+```
+
+### Qlib-Style Factor DSL
+
+```python
+from omnifinan.research.factors import ref, mean, std, rank, apply_factor
+
+# Primitives
+ref(series, 1)        # shift(1)
+mean(series, 5)       # rolling(5).mean()
+std(series, 20)       # rolling(20).std()
+rank(series, 20)      # rolling(20) rank of latest value
+
+# String expression interface
+result = apply_factor("Ref($close,1)", df)
+result = apply_factor("Mean($close,5)", df)
+```
+
 ## LLM Execution Guidance
 
 This section is for LLM runtime orchestration guidance only.
@@ -219,6 +309,13 @@ multi-agent orchestration:
   - supports `gex_expiration` (default `None`):
     - `None` => full-chain GEX
     - `YYYY-MM-DD` => GEX for that expiry only
+  - supports `exp_date` post-fetch expiry bucket filters:
+    - `all`
+    - `0dte`
+    - `Ndte` (nearest available DTE bucket, e.g. `7dte`)
+    - `monthly`
+    - `quarterly`
+    - combinable with `+`, e.g. `7dte+monthly`
 - `get_futures_option_chain_analytics` (new; non-LLM)
 
 ### Option Analytics (Non-LLM) Guidance
@@ -228,6 +325,7 @@ When the task asks for IV/skew/term-structure/Greeks, use analytics APIs first:
 - `UnifiedDataService.get_stock_option_chain_analytics(...)`
   - `risk_free_rate` can be omitted; service resolves from macro yields (`us_treasury_2y` then `us_treasury_10y`) before fallback.
   - `contract_multiplier` supports explicit override; default is 100.
+  - provider `iv` inputs are normalized to decimal volatility at chain level before Greeks/GEX computation, so values such as `87.4` are interpreted as `87.4%`, not `87.4x` vol.
 - `UnifiedDataService.get_futures_option_chain_analytics(...)`
 
 Market compatibility rule:
@@ -253,6 +351,10 @@ Return contract from analytics APIs:
 - `analytics.implied_vs_realized` (`current_atm_iv`, `historical_volatility`, `iv_minus_hv`, `iv_to_hv_ratio`)
 - `analytics.summary.iv_historical_percentile` (requires `iv_history` input)
 - `analytics.errors` (explicit calculation issues)
+
+`get_stock_option_gex(...)` return notes:
+- `gex_data.metadata.gamma_flip_price` is only populated when net GEX crosses zero inside the internal spot sweep band (`0.7x` to `1.3x` current spot).
+- If no sign change occurs inside that band, `gamma_flip_price` remains `null`; this means “no zero-gamma root found in search band”, not “missing data”.
 
 ### LLM-as-Glue Fallback Pattern
 
@@ -394,12 +496,14 @@ pytest tests/test_macro_source_policy.py
 pytest tests/test_macro_structured.py
 pytest tests/test_macro_visualize.py
 
+# Factor mining and backtest (requires scipy)
+pytest tests/test_factor_mining.py
+pytest tests/test_factor_backtest.py
+
 # Other test suites
 pytest tests/test_agent_graphs.py
 pytest tests/test_agent_edges.py
 pytest tests/test_data_cache.py
-pytest tests/test_factor_mining.py
-pytest tests/test_factor_backtest.py
 pytest tests/test_llm_client.py
 pytest tests/test_runtime_config.py
 pytest tests/test_sec_edgar_provider.py
