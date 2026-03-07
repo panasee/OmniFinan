@@ -5,6 +5,7 @@ from omnifinan.data.symbols import (
     is_crypto_ticker,
     is_hk_equity_ticker,
     is_non_option_equity_market_ticker,
+    normalize_crypto_price_ticker,
     normalize_crypto_option_underlying,
 )
 
@@ -37,3 +38,11 @@ def test_normalize_crypto_option_underlying():
     assert normalize_crypto_option_underlying("BTCUSDT") == "BTC"
     assert normalize_crypto_option_underlying("ETH") == "ETH"
     assert normalize_crypto_option_underlying("AAPL") == "AAPL"
+
+
+def test_normalize_crypto_price_ticker():
+    assert normalize_crypto_price_ticker("BTC") == "BTC-USD"
+    assert normalize_crypto_price_ticker("BTCUSDT") == "BTC-USD"
+    assert normalize_crypto_price_ticker("BTC-USDT") == "BTC-USD"
+    assert normalize_crypto_price_ticker("ETH/USDC") == "ETH-USD"
+    assert normalize_crypto_price_ticker("ETH-USD") == "ETH-USD"

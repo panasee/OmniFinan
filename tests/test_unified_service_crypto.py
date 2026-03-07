@@ -5,6 +5,7 @@ from pathlib import Path
 from omnifinan.data.cache import DataCache
 from omnifinan.data.providers.base import DataProvider
 from omnifinan.data.providers.yfinance_provider import YFinanceProvider
+from omnifinan.data.symbols import normalize_crypto_price_ticker
 from omnifinan.data.unified_service import UnifiedDataService
 from omnifinan.data_models import CompanyNews, FinancialMetrics, InsiderTrade, LineItem, MarketType, Price
 
@@ -118,3 +119,73 @@ def test_unified_service_non_crypto_uses_primary_provider(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["close"] == 10.5
     assert provider.price_calls == 1
+
+
+def test_yfinance_provider_normalizes_bare_crypto_to_yahoo_pair(monkeypatch):
+    provider = YFinanceProvider()
+    captured = {"symbol": None}
+
+    class _FakeYF:
+        @staticmethod
+        def download(symbol, start=None, end=None, interval="1d", auto_adjust=False, progress=False, threads=False):
+            _ = start, end, interval, auto_adjust, progress, threads
+            captured["symbol"] = symbol
+            import pandas as pd
+
+            df = pd.DataFrame(
+                {
+                    "Open": [1.0],
+                    "High": [1.0],
+                    "Low": [1.0],
+                    "Close": [1.0],
+                    "Volume": [1],
+                },
+                index=pd.to_datetime(["2025-01-01"]),
+            )
+            df.index.name = "Date"
+            return df
+
+    monkeypatch.setattr(provider, "_import_yf", lambda: _FakeYF())
+
+    rows = provider.get_prices("BTC", "2025-01-01", "2025-01-02")
+    assert len(rows) == 1
+    assert captured["symbol"] == "BTC-USD"
+
+
+def test_unified_service_crypto_price_cache_key_is_normalized(monkeypatch, tmp_path: Path):
+    provider = _DummyProvider()
+    service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
+
+    yfinance_calls = {"count": 0}
+
+    def fake_get_prices(
+        self,
+        ticker: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        interval: str = "1d",
+    ) -> list[Price]:
+        _ = self, ticker, start_date, end_date, interval
+        yfinance_calls["count"] += 1
+        return [
+            Price(
+                open=1.0,
+                high=1.0,
+                low=1.0,
+                close=1.0,
+                volume=1,
+                amount=1.0,
+                time="2025-01-01",
+                market=None,
+            )
+        ]
+
+    monkeypatch.setattr(YFinanceProvider, "get_prices", fake_get_prices)
+
+    rows_one = service.get_prices("BTC", "2025-01-01", "2025-01-01")
+    rows_two = service.get_prices("BTC-USDT", "2025-01-01", "2025-01-01")
+
+    assert len(rows_one) == 1
+    assert len(rows_two) == 1
+    assert yfinance_calls["count"] == 1
+    assert normalize_crypto_price_ticker("BTC") == "BTC-USD"

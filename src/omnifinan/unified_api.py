@@ -534,8 +534,17 @@ def _fred_fetch_series(
     api_key = _get_fred_api_key()
     if api_key:
         params["api_key"] = api_key
-    if start_date:
-        params["observation_start"] = start_date
+    # For yoy transforms we need ≥12 months of prior data for the shift(12) calculation.
+    # Push observation_start back 13 months so the caller's start_date window has valid yoy values.
+    fetch_start = start_date
+    if transform == "yoy" and start_date:
+        try:
+            _sd = pd.to_datetime(start_date)
+            fetch_start = (_sd - pd.DateOffset(months=13)).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    if fetch_start:
+        params["observation_start"] = fetch_start
     if end_date:
         params["observation_end"] = end_date
     def _finalize(df: pd.DataFrame) -> dict[str, Any]:
@@ -583,8 +592,8 @@ def _fred_fetch_series(
     # Fallback: official FRED graph CSV endpoint (works in environments where JSON API rejects requests).
     try:
         csv_params: dict[str, Any] = {"id": series_id}
-        if start_date:
-            csv_params["cosd"] = start_date
+        if fetch_start:
+            csv_params["cosd"] = fetch_start
         if end_date:
             csv_params["coed"] = end_date
         resp_csv = requests.get(
@@ -1636,12 +1645,6 @@ def get_macro_indicators(
                 start_date=start_date,
                 end_date=end_date,
             )
-    if _want("sg_industrial_production_yoy"):
-        results["series"]["sg_industrial_production_yoy"] = _macro_error_payload(
-            "sg_industrial_production_yoy",
-            "fixed_sources_unavailable",
-            "unavailable in current fixed providers (AkShare/FRED/IMF/World Bank) for Singapore industrial production YoY",
-        )
     if _want("sg_unemployment_rate"):
         results["series"]["sg_unemployment_rate"] = _world_bank_fetch_series(
         series_name="sg_unemployment_rate",
@@ -2089,6 +2092,10 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "us_consumer_confidence_cb": "growth",
     "us_consumer_sentiment_michigan": "growth",
     "us_non_farm_payrolls": "growth",
+    "us_unemployment_rate": "growth",
+    "us_initial_jobless_claims": "growth",
+    "us_pmi_manufacturing": "growth",
+    "us_pmi_services": "growth",
     "china_gdp_yoy": "growth",
     "china_pmi_manufacturing": "growth",
     "china_pmi_services": "growth",
@@ -2096,10 +2103,13 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "china_retail_sales_yoy": "growth",
     "china_fixed_asset_investment_yoy": "growth",
     "china_exports_yoy": "growth",
+    "china_trade_balance": "growth",
+    "china_urban_unemployment": "growth",
     "sg_gdp_growth": "growth",
     "sg_gdp_yoy": "growth",
-    "sg_industrial_production_yoy": "growth",
     "sg_exports_growth": "growth",
+    "sg_unemployment_rate": "growth",
+    "sg_current_account_gdp": "growth",
     "sg_imports_growth": "growth",
     # Inflation
     "us_cpi_yoy": "inflation",
@@ -2111,6 +2121,7 @@ MACRO_DIMENSION_MAP: dict[str, str] = {
     "sg_inflation_cpi": "inflation",
     "sg_cpi_yoy": "inflation",
     "world_inflation": "inflation",
+    "world_gdp_growth": "growth",
     # Liquidity
     "fed_policy_rate": "liquidity",
     "pboc_policy_rate": "liquidity",

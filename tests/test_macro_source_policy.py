@@ -11,6 +11,8 @@ from omnifinan.data.unified_service import UnifiedDataService
 from omnifinan.data_models import CompanyNews, FinancialMetrics, InsiderTrade, LineItem, Price
 from omnifinan.unified_api import MACRO_SOURCE_POLICY_VERSION
 
+DATASET_KEY = f"{MACRO_SOURCE_POLICY_VERSION}__master"
+
 
 class _MacroDummyProvider(DataProvider):
     def __init__(self) -> None:
@@ -104,6 +106,11 @@ def _cache(tmp_path: Path) -> DataCache:
     return DataCache(root=tmp_path / "cache", max_entries_per_namespace=20)
 
 
+def _seed_macro(service: UnifiedDataService, data: dict) -> None:
+    """Write macro master payload directly into datasets."""
+    service.cache.set_dataset("macro_indicators_master", DATASET_KEY, data)
+
+
 def test_macro_source_policy_cache_and_history(tmp_path: Path):
     provider = _MacroDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
@@ -116,8 +123,7 @@ def test_macro_source_policy_cache_and_history(tmp_path: Path):
     assert one["latest"]["fed_policy_rate"] == 5.0
     assert two["latest"]["fed_policy_rate"] == 5.0
 
-    dataset_key = f"{MACRO_SOURCE_POLICY_VERSION}__master"
-    history = service.cache.get_dataset("macro_indicators_history", dataset_key)
+    history = service.cache.get_dataset("macro_indicators_history", DATASET_KEY)
     assert isinstance(history, list)
     assert len(history) == 1
 
@@ -150,6 +156,11 @@ def test_macro_deprecated_policy_caches_are_detached_on_active_calls(tmp_path: P
             f"{deprecated_version}__master",
             [{"legacy": True}],
         )
+        service.cache.set_dataset(
+            "macro_indicators_master",
+            f"{deprecated_version}__master",
+            {"legacy": True},
+        )
 
     _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
 
@@ -165,79 +176,80 @@ def test_macro_deprecated_policy_caches_are_detached_on_active_calls(tmp_path: P
             is None
         )
         assert (
-            service.cache.get(
-                "macro_indicators_structured",
-                {
-                    "start_date": "2025-01-01",
-                    "end_date": "2026-12-31",
-                    "source_policy_version": deprecated_version,
-                    "view": "structured_v1",
-                },
-            )
-            is None
-        )
-        assert (
             service.cache.get_dataset(
                 "macro_indicators_history",
                 f"{deprecated_version}__master",
             )
             is None
         )
+        assert (
+            service.cache.get_dataset(
+                "macro_indicators_master",
+                f"{deprecated_version}__master",
+            )
+            is None
+        )
 
 
-def test_macro_refresh_when_series_latest_date_is_stale(tmp_path: Path):
+def test_macro_stale_series_without_subset_returns_cached(tmp_path: Path):
+    """Stale series detected but provider lacks subset refresh: return cached, no full fetch."""
     provider = _MacroDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
 
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "fed_policy_rate": {
-                    "latest": {"date": "2020-01-01", "value": 1.0},
-                    "observations": [{"date": "2020-01-01", "value": 1.0}],
-                    "source": "fred:FEDFUNDS",
-                }
-            },
-            "latest": {"fed_policy_rate": 1.0},
-            "snapshot_at": "2026-02-15T00:00:00Z",
+    _seed_macro(service, {
+        "series": {
+            "fed_policy_rate": {
+                "latest": {"date": "2020-01-01", "value": 1.0},
+                "observations": [{"date": "2020-01-01", "value": 1.0}],
+                "source": "fred:FEDFUNDS",
+            }
         },
-    )
-    cache_file = service.cache._request_key_path("macro_indicators", params)
-    stale_ts = (datetime.now() - timedelta(days=2)).timestamp()
-    os.utime(cache_file, (stale_ts, stale_ts))
+        "latest": {"fed_policy_rate": 1.0},
+        "snapshot_at": "2026-02-15T00:00:00Z",
+    })
 
-    _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2025-12-31")
+    out = service.get_macro_indicators(start_date="2025-01-01", end_date="2025-12-31")
+    # Without subset support, non-force mode returns cached data (no auto full-refresh).
+    assert provider.calls == 0
+    assert out["latest"]["fed_policy_rate"] == 1.0
+
+
+def test_macro_stale_series_force_triggers_full_refresh(tmp_path: Path):
+    """With force=True, stale series triggers full provider fetch."""
+    provider = _MacroDummyProvider()
+    service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
+
+    _seed_macro(service, {
+        "series": {
+            "fed_policy_rate": {
+                "latest": {"date": "2020-01-01", "value": 1.0},
+                "observations": [{"date": "2020-01-01", "value": 1.0}],
+                "source": "fred:FEDFUNDS",
+            }
+        },
+        "latest": {"fed_policy_rate": 1.0},
+        "snapshot_at": "2026-02-15T00:00:00Z",
+    })
+
+    _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2025-12-31", force=True)
     assert provider.calls == 1
 
 
 def test_macro_refresh_when_cache_has_errors_even_if_fresh(tmp_path: Path):
     provider = _MacroDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "sofr": {
-                    "latest": None,
-                    "observations": [],
-                    "error": "400 bad request",
-                }
-            },
-            "latest": {"sofr": None},
-            "snapshot_at": "2026-02-15T00:00:00Z",
+
+    _seed_macro(service, {
+        "series": {
+            "sofr": {
+                "latest": None,
+                "observations": [],
+                "error": "400 bad request",
+            }
         },
-    )
+        "latest": {"sofr": None},
+        "snapshot_at": "2026-02-15T00:00:00Z",
+    })
 
     _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2025-12-31")
     assert provider.calls == 0
@@ -247,28 +259,20 @@ def test_macro_window_is_subset_of_master(tmp_path: Path):
     provider = _MacroDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
 
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "fed_policy_rate": {
-                    "observations": [
-                        {"date": "2025-01-01", "value": 5.0},
-                        {"date": "2025-06-01", "value": 4.75},
-                        {"date": "2025-12-01", "value": 4.5},
-                    ],
-                    "latest": {"date": "2025-12-01", "value": 4.5},
-                }
-            },
-            "latest": {"fed_policy_rate": 4.5},
-            "snapshot_at": "2026-02-15T00:00:00Z",
+    _seed_macro(service, {
+        "series": {
+            "fed_policy_rate": {
+                "observations": [
+                    {"date": "2025-01-01", "value": 5.0},
+                    {"date": "2025-06-01", "value": 4.75},
+                    {"date": "2025-12-01", "value": 4.5},
+                ],
+                "latest": {"date": "2025-12-01", "value": 4.5},
+            }
         },
-    )
+        "latest": {"fed_policy_rate": 4.5},
+        "snapshot_at": "2026-02-15T00:00:00Z",
+    })
     out = service.get_macro_indicators(start_date="2025-05-01", end_date="2025-11-01")
     assert provider.calls == 0
     obs = out["series"]["fed_policy_rate"]["observations"]
@@ -276,13 +280,13 @@ def test_macro_window_is_subset_of_master(tmp_path: Path):
     assert obs[0]["date"] == "2025-06-01"
 
 
-def test_macro_restores_request_cache_from_dataset_master(tmp_path: Path):
+def test_macro_reads_directly_from_dataset_master(tmp_path: Path):
+    """Master payload stored in datasets is read directly (no request_cache fallback)."""
     provider = _MacroDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
 
     today = date.today().strftime("%Y-%m-%d")
-    dataset_key = f"{MACRO_SOURCE_POLICY_VERSION}__master"
-    snapshot = {
+    _seed_macro(service, {
         "series": {
             "fed_policy_rate": {
                 "latest": {"date": today, "value": 4.5},
@@ -291,43 +295,67 @@ def test_macro_restores_request_cache_from_dataset_master(tmp_path: Path):
         },
         "latest": {"fed_policy_rate": 4.5},
         "snapshot_at": "2026-02-16T00:00:00Z",
-    }
-    service.cache.set_dataset("macro_indicators_history", dataset_key, [snapshot])
+    })
 
     out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert provider.calls == 0
     assert out["latest"]["fed_policy_rate"] == 4.5
 
 
+def test_macro_migrates_request_cache_to_datasets(tmp_path: Path):
+    """Existing request_cache data is migrated to datasets on first call."""
+    provider = _MacroDummyProvider()
+    cache = _cache(tmp_path)
+
+    today = date.today().strftime("%Y-%m-%d")
+    params = {"scope": "master", "source_policy_version": MACRO_SOURCE_POLICY_VERSION}
+    cache.set("macro_indicators", params, {
+        "series": {
+            "fed_policy_rate": {
+                "latest": {"date": today, "value": 4.5},
+                "observations": [{"date": today, "value": 4.5}],
+                "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+        },
+        "latest": {"fed_policy_rate": 4.5},
+        "snapshot_at": "2026-02-16T00:00:00Z",
+    })
+
+    service = UnifiedDataService(provider=provider, cache=cache)
+    out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
+    assert provider.calls == 0
+    assert out["latest"]["fed_policy_rate"] == 4.5
+    # Verify data now lives in datasets
+    ds = cache.get_dataset("macro_indicators_master", DATASET_KEY)
+    assert isinstance(ds, dict)
+    assert ds["latest"]["fed_policy_rate"] == 4.5
+    # Verify request_cache dir was cleaned up
+    rc_dir = cache.request_root / "macro_indicators"
+    assert not rc_dir.exists() or not list(rc_dir.glob("*.json"))
+
+
 def test_macro_refreshes_only_missing_series_when_subset_supported(tmp_path: Path):
     provider = _MacroSubsetDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "sofr": {
-                    "latest": None,
-                    "observations": [],
-                    "error": "temporary gateway timeout",
-                    "source": "fred:SOFR",
-                },
-                "us_pmi_manufacturing": {
-                    "latest": None,
-                    "observations": [],
-                    "error": "unavailable in current fixed providers (FRED/IMF/WB)",
-                    "source": "fixed_sources_unavailable",
-                },
+
+    _seed_macro(service, {
+        "series": {
+            "sofr": {
+                "latest": None,
+                "observations": [],
+                "error": "temporary gateway timeout",
+                "source": "fred:SOFR",
             },
-            "latest": {"sofr": None, "us_pmi_manufacturing": None},
-            "snapshot_at": "2026-02-15T00:00:00Z",
+            "us_pmi_manufacturing": {
+                "latest": None,
+                "observations": [],
+                "error": "unavailable in current fixed providers (FRED/IMF/WB)",
+                "source": "fixed_sources_unavailable",
+            },
         },
-    )
+        "latest": {"sofr": None, "us_pmi_manufacturing": None},
+        "snapshot_at": "2026-02-15T00:00:00Z",
+    })
     out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert provider.calls == 0
     assert provider.subset_calls == 1
@@ -340,34 +368,27 @@ def test_macro_skips_refetch_when_recently_fetched(tmp_path: Path):
     provider = _MacroSubsetDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "sofr": {
-                    "latest": {"date": "2026-02-20", "value": 4.3},
-                    "observations": [{"date": "2026-02-20", "value": 4.3}],
-                    "source": "fred:SOFR",
-                    "error": None,
-                    "fetched_at": now_iso,
-                },
-                "us_treasury_10y": {
-                    "latest": {"date": "2026-02-20", "value": 4.1},
-                    "observations": [{"date": "2026-02-20", "value": 4.1}],
-                    "source": "fred:DGS10",
-                    "error": None,
-                    "fetched_at": now_iso,
-                },
+
+    _seed_macro(service, {
+        "series": {
+            "sofr": {
+                "latest": {"date": "2026-02-20", "value": 4.3},
+                "observations": [{"date": "2026-02-20", "value": 4.3}],
+                "source": "fred:SOFR",
+                "error": None,
+                "fetched_at": now_iso,
             },
-            "latest": {"sofr": 4.3, "us_treasury_10y": 4.1},
-            "snapshot_at": "2026-02-20T00:00:00Z",
+            "us_treasury_10y": {
+                "latest": {"date": "2026-02-20", "value": 4.1},
+                "observations": [{"date": "2026-02-20", "value": 4.1}],
+                "source": "fred:DGS10",
+                "error": None,
+                "fetched_at": now_iso,
+            },
         },
-    )
+        "latest": {"sofr": 4.3, "us_treasury_10y": 4.1},
+        "snapshot_at": "2026-02-20T00:00:00Z",
+    })
     _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert provider.calls == 0
     assert provider.subset_calls == 0
@@ -378,27 +399,20 @@ def test_macro_refetches_when_fetched_at_is_old(tmp_path: Path):
     provider = _MacroSubsetDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     old_fetch = (datetime.now() - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%S")
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "sofr": {
-                    "latest": {"date": "2026-02-15", "value": 4.3},
-                    "observations": [{"date": "2026-02-15", "value": 4.3}],
-                    "source": "fred:SOFR",
-                    "error": None,
-                    "fetched_at": old_fetch,
-                },
+
+    _seed_macro(service, {
+        "series": {
+            "sofr": {
+                "latest": {"date": "2026-02-15", "value": 4.3},
+                "observations": [{"date": "2026-02-15", "value": 4.3}],
+                "source": "fred:SOFR",
+                "error": None,
+                "fetched_at": old_fetch,
             },
-            "latest": {"sofr": 4.3},
-            "snapshot_at": "2026-02-20T00:00:00Z",
         },
-    )
+        "latest": {"sofr": 4.3},
+        "snapshot_at": "2026-02-20T00:00:00Z",
+    })
     _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert provider.subset_calls == 1
     assert "sofr" in provider.last_subset_keys
@@ -409,34 +423,27 @@ def test_macro_error_series_with_recent_fetched_at_not_refetched(tmp_path: Path)
     provider = _MacroSubsetDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "sofr": {
-                    "latest": None,
-                    "observations": [],
-                    "error": "temporary gateway timeout",
-                    "source": "fred:SOFR",
-                    "fetched_at": now_iso,
-                },
-                "fed_policy_rate": {
-                    "latest": {"date": date.today().strftime("%Y-%m-%d"), "value": 5.0},
-                    "observations": [{"date": date.today().strftime("%Y-%m-%d"), "value": 5.0}],
-                    "source": "fred:FEDFUNDS",
-                    "error": None,
-                    "fetched_at": now_iso,
-                },
+
+    _seed_macro(service, {
+        "series": {
+            "sofr": {
+                "latest": None,
+                "observations": [],
+                "error": "temporary gateway timeout",
+                "source": "fred:SOFR",
+                "fetched_at": now_iso,
             },
-            "latest": {"sofr": None, "fed_policy_rate": 5.0},
-            "snapshot_at": "2026-02-20T00:00:00Z",
+            "fed_policy_rate": {
+                "latest": {"date": date.today().strftime("%Y-%m-%d"), "value": 5.0},
+                "observations": [{"date": date.today().strftime("%Y-%m-%d"), "value": 5.0}],
+                "source": "fred:FEDFUNDS",
+                "error": None,
+                "fetched_at": now_iso,
+            },
         },
-    )
+        "latest": {"sofr": None, "fed_policy_rate": 5.0},
+        "snapshot_at": "2026-02-20T00:00:00Z",
+    })
     _ = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert provider.calls == 0
     assert provider.subset_calls == 0
@@ -502,11 +509,8 @@ def test_macro_when_provider_raises_returns_existing_cache(tmp_path: Path):
     """当 provider 全量拉取抛异常（如 akshare 报错）时，应返回已有缓存，不覆盖、不重复拉取已有数据。"""
     provider = _MacroRaisingProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    existing = {
+
+    _seed_macro(service, {
         "series": {
             "fed_policy_rate": {
                 "latest": {"date": "2026-02-01", "value": 4.5},
@@ -525,8 +529,7 @@ def test_macro_when_provider_raises_returns_existing_cache(tmp_path: Path):
         },
         "latest": {"fed_policy_rate": 4.5, "sofr": 4.3},
         "snapshot_at": "2026-02-01T00:00:00Z",
-    }
-    service.cache.set("macro_indicators", params, existing)
+    })
 
     out = service.get_macro_indicators(start_date="2026-01-01", end_date="2026-02-28")
     assert provider.calls == 0
@@ -540,11 +543,8 @@ def test_macro_when_subset_and_full_both_raise_returns_existing(tmp_path: Path):
     """Subset 拉取异常时仍返回已有缓存；非 force 模式下不自动回退全量刷新。"""
     provider = _MacroSubsetRaisingProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    existing = {
+
+    _seed_macro(service, {
         "series": {
             "china_cpi_mom": {
                 "latest": {"date": "2025-06-15", "value": 0.8},
@@ -556,8 +556,7 @@ def test_macro_when_subset_and_full_both_raise_returns_existing(tmp_path: Path):
         },
         "latest": {"china_cpi_mom": 0.8},
         "snapshot_at": "2025-06-15T00:00:00Z",
-    }
-    service.cache.set("macro_indicators", params, existing)
+    })
 
     out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-02-28")
     assert out["latest"]["china_cpi_mom"] == 0.8
@@ -570,33 +569,28 @@ def test_macro_merge_preserves_existing_when_incoming_has_error_for_series(tmp_p
     """强制刷新时若某 series 本次拉取为 error/空，应保留本地已有该 series 的数据。"""
     provider = _MacroPartialErrorProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    existing = {
+    old_fetched = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    _seed_macro(service, {
         "series": {
             "fed_policy_rate": {
                 "latest": {"date": "2026-01-15", "value": 4.5},
                 "observations": [{"date": "2026-01-15", "value": 4.5}],
                 "source": "fred:FEDFUNDS",
                 "error": None,
+                "fetched_at": old_fetched,
             },
             "china_lpr_1y": {
                 "latest": {"date": "2026-01-20", "value": 3.45},
                 "observations": [{"date": "2026-01-20", "value": 3.45}],
                 "source": "akshare:china_official:pboc",
                 "error": None,
+                "fetched_at": old_fetched,
             },
         },
         "latest": {"fed_policy_rate": 4.5, "china_lpr_1y": 3.45},
         "snapshot_at": "2026-01-15T00:00:00Z",
-    }
-    service.cache.set("macro_indicators", params, existing)
-    old_fetched = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S")
-    for key in ("fed_policy_rate", "china_lpr_1y"):
-        existing["series"][key]["fetched_at"] = old_fetched
-    service.cache.set("macro_indicators", params, existing)
+    })
 
     out = service.get_macro_indicators(start_date="2026-01-01", end_date="2026-02-28", force=True)
     merged = out["series"]
@@ -613,34 +607,27 @@ def test_macro_no_full_fetch_when_cache_fresh_and_complete(tmp_path: Path):
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
     today = date.today().strftime("%Y-%m-%d")
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "fed_policy_rate": {
-                    "latest": {"date": today, "value": 5.0},
-                    "observations": [{"date": today, "value": 5.0}],
-                    "source": "fred:FEDFUNDS",
-                    "error": None,
-                    "fetched_at": now_iso,
-                },
-                "sofr": {
-                    "latest": {"date": today, "value": 4.3},
-                    "observations": [{"date": today, "value": 4.3}],
-                    "source": "fred:SOFR",
-                    "error": None,
-                    "fetched_at": now_iso,
-                },
+
+    _seed_macro(service, {
+        "series": {
+            "fed_policy_rate": {
+                "latest": {"date": today, "value": 5.0},
+                "observations": [{"date": today, "value": 5.0}],
+                "source": "fred:FEDFUNDS",
+                "error": None,
+                "fetched_at": now_iso,
             },
-            "latest": {"fed_policy_rate": 5.0, "sofr": 4.3},
-            "snapshot_at": f"{today}T00:00:00Z",
+            "sofr": {
+                "latest": {"date": today, "value": 4.3},
+                "observations": [{"date": today, "value": 4.3}],
+                "source": "fred:SOFR",
+                "error": None,
+                "fetched_at": now_iso,
+            },
         },
-    )
+        "latest": {"fed_policy_rate": 5.0, "sofr": 4.3},
+        "snapshot_at": f"{today}T00:00:00Z",
+    })
 
     out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert provider.calls == 0
@@ -708,34 +695,27 @@ def test_macro_replacements_use_dbnomics_and_fred_sources(monkeypatch):
 def test_retired_macro_series_are_pruned_from_cached_payload(tmp_path: Path):
     provider = _MacroDummyProvider()
     service = UnifiedDataService(provider=provider, cache=_cache(tmp_path))
-    params = {
-        "scope": "master",
-        "source_policy_version": MACRO_SOURCE_POLICY_VERSION,
-    }
-    service.cache.set(
-        "macro_indicators",
-        params,
-        {
-            "series": {
-                "fed_policy_rate": {
-                    "latest": {"date": "2026-02-01", "value": 5.0},
-                    "observations": [{"date": "2026-02-01", "value": 5.0}],
-                    "source": "fred:FEDFUNDS",
-                    "error": None,
-                    "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                },
-                "china_cpi_yoy": {
-                    "latest": {"date": "2025-08-09", "value": 0.0},
-                    "observations": [{"date": "2025-08-09", "value": 0.0}],
-                    "source": "akshare:china_official:nbs",
-                    "error": None,
-                    "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                },
+
+    _seed_macro(service, {
+        "series": {
+            "fed_policy_rate": {
+                "latest": {"date": "2026-02-01", "value": 5.0},
+                "observations": [{"date": "2026-02-01", "value": 5.0}],
+                "source": "fred:FEDFUNDS",
+                "error": None,
+                "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             },
-            "latest": {"fed_policy_rate": 5.0, "china_cpi_yoy": 0.0},
-            "snapshot_at": "2026-02-01T00:00:00Z",
+            "china_cpi_yoy": {
+                "latest": {"date": "2025-08-09", "value": 0.0},
+                "observations": [{"date": "2025-08-09", "value": 0.0}],
+                "source": "akshare:china_official:nbs",
+                "error": None,
+                "fetched_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            },
         },
-    )
+        "latest": {"fed_policy_rate": 5.0, "china_cpi_yoy": 0.0},
+        "snapshot_at": "2026-02-01T00:00:00Z",
+    })
 
     out = service.get_macro_indicators(start_date="2025-01-01", end_date="2026-12-31")
     assert "china_cpi_yoy" not in out["series"]

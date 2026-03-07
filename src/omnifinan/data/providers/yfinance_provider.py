@@ -6,7 +6,7 @@ import pandas as pd
 
 from ...data_models import CompanyNews, FinancialMetrics, InsiderTrade, LineItem, Price
 from ...unified_api import detect_market, normalize_ticker
-from ..symbols import is_crypto_ticker
+from ..symbols import is_crypto_ticker, normalize_crypto_price_ticker
 from .akshare_provider import AkshareProvider
 from .base import DataProvider
 
@@ -30,7 +30,7 @@ class YFinanceProvider(DataProvider):
         interval: str = "1d",
     ) -> list[Price]:
         is_crypto = is_crypto_ticker(ticker)
-        symbol = ticker.strip().upper().replace("/", "-") if is_crypto else normalize_ticker(ticker)
+        symbol = normalize_crypto_price_ticker(ticker) if is_crypto else normalize_ticker(ticker)
 
         # Yahoo Finance supports additional non-equity tickers (FX `...=X`, futures `...=F`,
         # some indices `^...`, etc.). These may not map to a known equity market.

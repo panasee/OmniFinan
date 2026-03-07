@@ -27,6 +27,36 @@ def _safe_float(value: Any) -> float | None:
     return out
 
 
+def _infer_iv_scale(rows: list[dict[str, Any]]) -> float:
+    """Infer whether provider IV values are decimals or percentage points.
+
+    Some providers emit implied volatility as percentage points (e.g. 87.4 for 87.4%),
+    while the Black-Scholes helpers here expect decimal volatility (0.874).
+    Infer scale at chain level so a mixed chain like [87.4, 1.12] is treated
+    consistently as percentage points.
+    """
+    raw_ivs = sorted(
+        v for v in (_safe_float(row.get("iv")) for row in rows) if v is not None and v > 0
+    )
+    if not raw_ivs:
+        return 1.0
+    median_iv = raw_ivs[len(raw_ivs) // 2]
+    return 0.01 if median_iv > 3.0 else 1.0
+
+
+def _normalize_iv(iv: float | None, iv_scale: float) -> float | None:
+    if iv is None or iv <= 0:
+        return None
+    out = iv * iv_scale
+    if out <= 0:
+        return None
+    # Reject pathological values that would dominate Greeks/GEX and are unlikely
+    # to be actionable for downstream analytics.
+    if out > 5.0:
+        return None
+    return out
+
+
 def _parse_option_type(row: dict[str, Any]) -> str | None:
     for key in ("side", "type", "option_type", "right"):
         raw = str(row.get(key, "")).strip().lower()
@@ -359,6 +389,7 @@ def compute_chain_analytics(
     contract_multiplier: float = 100.0,
 ) -> dict[str, Any]:
     snapshot_dt = _parse_snapshot_datetime(snapshot_date)
+    iv_scale = _infer_iv_scale(rows)
 
     spot = _safe_float(underlying_price)
     if spot is None:
@@ -395,7 +426,7 @@ def compute_chain_analytics(
             continue
         ttm = max(dte_days / 365.0, 1e-6)
 
-        iv = _safe_float(row.get("iv"))
+        iv = _normalize_iv(_safe_float(row.get("iv")), iv_scale)
         if iv is None or iv <= 0:
             if market_price is not None:
                 iv = compute_implied_volatility(

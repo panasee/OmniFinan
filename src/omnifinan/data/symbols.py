@@ -99,6 +99,24 @@ def normalize_crypto_ticker(ticker: str) -> str:
     return f"{symbol}-USDT"
 
 
+def normalize_crypto_price_ticker(ticker: str) -> str:
+    """Normalize a crypto symbol to a Yahoo-price-friendly pair.
+
+    Rules:
+    - bare symbols default to ``-USD`` for price history (`BTC` -> `BTC-USD`)
+    - stablecoin quotes are mapped to ``USD`` (`BTC-USDT` -> `BTC-USD`)
+    - slash-separated pairs are canonicalized
+    - other quotes are preserved as ``BASE-QUOTE``
+    """
+    normalized = normalize_crypto_ticker(ticker)
+    if "-" not in normalized:
+        return normalized
+    base, quote = normalized.split("-", 1)
+    if quote in {"USDT", "USDC", "BUSD"}:
+        quote = "USD"
+    return f"{base}-{quote}"
+
+
 def is_hk_equity_ticker(ticker: str | None) -> bool:
     """Return True if ticker looks like a Hong Kong equity code."""
     if not ticker:

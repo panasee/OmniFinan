@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from statistics import median
 from typing import Any
 
@@ -20,6 +20,7 @@ from .providers.yfinance_provider import YFinanceProvider
 from .symbols import (
     is_crypto_ticker,
     is_non_option_equity_market_ticker,
+    normalize_crypto_price_ticker,
     normalize_crypto_option_underlying,
 )
 
@@ -109,6 +110,32 @@ class UnifiedDataService:
                 "macro_indicators_history",
                 f"{deprecated_version}__master",
             )
+            self.cache.delete_dataset(
+                "macro_indicators_master",
+                f"{deprecated_version}__master",
+            )
+
+        # Migrate active-policy data from request_cache → datasets (one-time).
+        active_dataset_key = f"{active_policy_version}__master"
+        if self.cache.get_dataset("macro_indicators_master", active_dataset_key) is None:
+            rc_params = {"scope": "master", "source_policy_version": active_policy_version}
+            rc_data = self.cache.get("macro_indicators", rc_params)
+            if isinstance(rc_data, dict):
+                self.cache.set_dataset("macro_indicators_master", active_dataset_key, rc_data)
+                logger.info("Macro master migrated from request_cache to datasets.")
+        # Clean up legacy request_cache entries for macro (no longer used).
+        for ns in ("macro_indicators", "macro_indicators_structured"):
+            ns_dir = self.cache.request_root / ns
+            if ns_dir.is_dir():
+                for f in ns_dir.glob("*.json"):
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+                try:
+                    ns_dir.rmdir()
+                except Exception:
+                    pass
 
     def _unsupported_stock_option_payload(self, symbol: str, reason: str) -> dict[str, Any]:
         clean_symbol = str(symbol or "").strip().upper()
@@ -224,6 +251,32 @@ class UnifiedDataService:
                 return float(rate), f"macro:{key}"
 
         return 0.02, "fallback_default"
+
+    @staticmethod
+    def _try_yfinance_realtime_price(
+        symbol: str,
+        fallback_price: float | None,
+        fallback_source: str | None,
+    ) -> tuple[float | None, str | None]:
+        """Try to get a real-time price from yfinance for intraday consistency.
+
+        Returns the yfinance price if available, otherwise the fallback.
+        """
+        try:
+            import yfinance as yf  # type: ignore
+
+            yf_symbol = str(symbol).strip().upper()
+            # Normalize index symbols
+            _index_map = {".SPX": "^GSPC", "SPX": "^GSPC", "SPXW": "^GSPC", "^SPX": "^GSPC"}
+            yf_symbol = _index_map.get(yf_symbol, yf_symbol)
+
+            ticker = yf.Ticker(yf_symbol)
+            price = ticker.fast_info.last_price
+            if price is not None and float(price) > 0:
+                return float(price), f"yfinance:realtime:{yf_symbol}"
+        except Exception:
+            pass
+        return fallback_price, fallback_source
 
     def _interval_to_timedelta(self, interval: str) -> timedelta:
         text = str(interval or "1d").strip().lower()
@@ -749,7 +802,8 @@ class UnifiedDataService:
         interval: str = "1d",
         force: bool = False,
     ):
-        dataset_key = f"{self._ticker_key(ticker)}__{interval}"
+        cache_ticker = normalize_crypto_price_ticker(ticker) if is_crypto_ticker(ticker) else ticker
+        dataset_key = f"{self._ticker_key(cache_ticker)}__{interval}"
         stored = self.cache.get_dataset("prices", dataset_key) or []
         stored = self._sort_by_date(stored, "time")
         price_provider = self._get_crypto_provider() if is_crypto_ticker(ticker) else self.provider
@@ -880,27 +934,11 @@ class UnifiedDataService:
         self._retire_deprecated_macro_policy_caches(start_date=start_date, end_date=end_date)
         source_policy_version = self._macro_source_policy_version()
         dataset_key = f"{source_policy_version}__master"
-        params = {
-            "scope": "master",
-            "source_policy_version": source_policy_version,
-        }
-        cached = self.cache.get("macro_indicators", params, ttl_seconds=self.ttl_seconds)
+
+        # Read master payload from persistent datasets (immune to cleanup_expired).
+        cached = self.cache.get_dataset("macro_indicators_master", dataset_key)
         payload = cached if isinstance(cached, dict) else None
         today = date.today()
-
-        # Request-cache miss fallback: restore latest master snapshot from dataset history.
-        if payload is None:
-            history = self.cache.get_dataset("macro_indicators_history", dataset_key) or []
-            if isinstance(history, list):
-                candidates = [item for item in history if isinstance(item, dict)]
-                if candidates:
-                    candidates = sorted(candidates, key=lambda x: str(x.get("snapshot_at", "")))
-                    payload = candidates[-1]
-                    self.cache.set("macro_indicators", params, payload)
-                    logger.info(
-                        "Macro request cache restored from dataset master snapshot. snapshot_at=%s",
-                        str(payload.get("snapshot_at", "")),
-                    )
 
         if force:
             logger.info("Macro force refresh requested. window=%s~%s", start_date, end_date)
@@ -932,7 +970,7 @@ class UnifiedDataService:
                         if isinstance(partial, dict):
                             before = payload
                             payload = self._merge_macro_payloads(payload or {}, partial)
-                            self.cache.set("macro_indicators", params, payload)
+                            self.cache.set_dataset("macro_indicators_master", dataset_key, payload)
                             summary = self._macro_update_summary(before, payload)
                             if summary:
                                 logger.info("Macro missing-series refresh updated: %s", summary)
@@ -967,7 +1005,7 @@ class UnifiedDataService:
             if isinstance(fresh, dict):
                 before = payload
                 payload = self._merge_macro_payloads(payload or {}, fresh)
-                self.cache.set("macro_indicators", params, payload)
+                self.cache.set_dataset("macro_indicators_master", dataset_key, payload)
                 summary = self._macro_update_summary(before, payload)
                 if summary:
                     logger.info("Macro master data updated. query_window=%s~%s series=%s", start_date, end_date, summary)
@@ -1003,17 +1041,13 @@ class UnifiedDataService:
         self._retire_deprecated_macro_policy_caches(start_date=start_date, end_date=end_date)
         raw = self.get_macro_indicators(start_date=start_date, end_date=end_date, force=force)
         source_policy_version = self._macro_source_policy_version()
-        params = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "source_policy_version": source_policy_version,
-            "view": "structured_v1",
-        }
-        cached = None if force else self.cache.get("macro_indicators_structured", params, ttl_seconds=self.ttl_seconds)
-        if isinstance(cached, dict):
-            return cached
+        structured_key = f"{source_policy_version}__{start_date or 'none'}__{end_date or 'none'}__structured_v1"
+        if not force:
+            cached = self.cache.get_dataset("macro_indicators_structured", structured_key)
+            if isinstance(cached, dict):
+                return cached
         structured = structure_macro_indicators(raw if isinstance(raw, dict) else {})
-        self.cache.set("macro_indicators_structured", params, structured)
+        self.cache.set_dataset("macro_indicators_structured", structured_key, structured)
         return structured
 
     def get_company_news(
@@ -1370,7 +1404,9 @@ class UnifiedDataService:
 
         # Underlying spot resolution policy:
         # - Do NOT use options-provider injected underlying prices.
-        # - Prefer OmniFinan price interfaces (get_prices) and use latest close.
+        # - Prefer OmniFinan price interfaces (get_prices) for latest close.
+        # - During market hours, if daily close is stale (not today),
+        #   use yfinance real-time quote for temporal consistency with option snapshot.
         resolved_underlying_price = underlying_price
         resolved_underlying_price_source: str | None = None
         if resolved_underlying_price is None:
@@ -1403,6 +1439,28 @@ class UnifiedDataService:
                     if close_v is not None:
                         resolved_underlying_price = float(close_v)
                         resolved_underlying_price_source = f"prices:close@{last.get('time')}"
+            except Exception:
+                pass
+
+        # If the latest close is not from today, try yfinance real-time quote
+        # to stay temporally consistent with real-time option snapshots.
+        if resolved_underlying_price is not None:
+            try:
+                today_str = date.today().strftime("%Y-%m-%d")
+                src = resolved_underlying_price_source or ""
+                # Extract date from source like "prices:close@2026-03-05"
+                src_date = src.split("@")[-1][:10] if "@" in src else ""
+                if src_date != today_str:
+                    resolved_underlying_price, resolved_underlying_price_source = (
+                        self._try_yfinance_realtime_price(symbol, resolved_underlying_price, resolved_underlying_price_source)
+                    )
+            except Exception:
+                pass
+        elif resolved_underlying_price is None:
+            try:
+                resolved_underlying_price, resolved_underlying_price_source = (
+                    self._try_yfinance_realtime_price(symbol, None, None)
+                )
             except Exception:
                 pass
 
@@ -1439,6 +1497,7 @@ class UnifiedDataService:
         symbol: str,
         expiration: str | None = None,
         gex_expiration: str | None = None,
+        exp_date: str = "all",
         option_type: str | None = None,
         strike: float | None = None,
         min_dte: int | None = None,
@@ -1489,54 +1548,147 @@ class UnifiedDataService:
         rows = analytics_payload.get("data") if isinstance(analytics_payload.get("data"), list) else []
 
         spot = float(summary.get("underlying_price") or 0.0)
-        rows_total = int(summary.get("option_count") or len(rows) or 0)
-        rows_usable = int(summary.get("enriched_count") or 0)
-        quality = float(rows_usable / rows_total) if rows_total > 0 else 0.0
         contract_mult = float(summary.get("contract_multiplier") or meta.get("contract_multiplier") or 100.0)
         risk_free = float(summary.get("risk_free_rate") or meta.get("risk_free_rate") or 0.02)
 
-        # Build strike profile + term buckets from raw chain rows.
+        # Build strike profile + term buckets from analytics enriched rows.
+        # Using analytics.surface ensures GEX values are consistent with summary.
         def _norm_pdf(x: float) -> float:
             return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-        now_ts = datetime.utcnow().timestamp()
-        sec_per_year = 365.0 * 24.0 * 3600.0
+        surface = ((analytics_payload.get("analytics") or {}).get("surface")) or []
+
+        # --- exp_date filter: restrict to specific expiration buckets ---
+        _exp_date_input = (exp_date or "all").strip().lower()
+        _exp_date_resolved: list[str] = []  # human-readable dates kept
+        if _exp_date_input != "all" and surface:
+            _tokens = [t.strip() for t in _exp_date_input.split("+") if t.strip()]
+
+            # Build mapping: expiration_epoch (int) -> (dte_int, calendar_date)
+            _exp_info: dict[int, tuple[int, date]] = {}
+            for _e in surface:
+                _exp_epoch = _e.get("expiration")
+                _dte_val = _e.get("dte")
+                if _exp_epoch is not None and _dte_val is not None:
+                    _dte_int = int(round(float(_dte_val)))
+                    try:
+                        _ep_int = int(float(_exp_epoch))
+                        _cal = datetime.fromtimestamp(_ep_int, tz=timezone.utc).date()
+                    except Exception:
+                        continue
+                    _exp_info[_ep_int] = (_dte_int, _cal)
+
+            _unique_dtes = sorted(set(v[0] for v in _exp_info.values()))
+
+            def _is_third_friday(d: date) -> bool:
+                return d.weekday() == 4 and 15 <= d.day <= 21
+
+            _keep_epochs: set = set()
+            _today = datetime.utcnow().date()
+
+            for _tok in _tokens:
+                if _tok == "0dte":
+                    for _ep, (_d, _c) in _exp_info.items():
+                        if _d <= 1:
+                            _keep_epochs.add(_ep)
+                elif _tok.endswith("dte"):
+                    try:
+                        _target = int(_tok.replace("dte", ""))
+                    except ValueError:
+                        continue
+                    if _unique_dtes:
+                        _closest = min(_unique_dtes, key=lambda d, t=_target: abs(d - t))
+                        for _ep, (_d, _c) in _exp_info.items():
+                            if _d == _closest:
+                                _keep_epochs.add(_ep)
+                elif _tok == "monthly":
+                    _candidates = [(v[1], ep) for ep, v in _exp_info.items()
+                                   if _is_third_friday(v[1]) and v[1] >= _today]
+                    if _candidates:
+                        _candidates.sort()
+                        _nearest = _candidates[0][0]
+                        for _cal, _ep in _candidates:
+                            if _cal == _nearest:
+                                _keep_epochs.add(_ep)
+                elif _tok == "quarterly":
+                    _candidates = [(v[1], ep) for ep, v in _exp_info.items()
+                                   if _is_third_friday(v[1]) and v[1].month in (3, 6, 9, 12) and v[1] >= _today]
+                    if _candidates:
+                        _candidates.sort()
+                        _nearest = _candidates[0][0]
+                        for _cal, _ep in _candidates:
+                            if _cal == _nearest:
+                                _keep_epochs.add(_ep)
+
+            def _to_ep_int(v: Any) -> int | None:
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    return None
+
+            surface = [e for e in surface if _to_ep_int(e.get("expiration")) in _keep_epochs]
+            rows = [r for r in rows if _to_ep_int(r.get("expiration")) in _keep_epochs]
+            _exp_date_resolved = sorted(set(
+                v[1].isoformat() for ep, v in _exp_info.items() if ep in _keep_epochs
+            ))
+
+        # Compute row counts after exp_date filtering.
+        rows_total = len(rows)
+        rows_usable = len(surface)
+        quality = float(rows_usable / rows_total) if rows_total > 0 else 0.0
+
         net_by_strike: dict[float, float] = {}
         bucket_net = {"zero_dte": 0.0, "near_term_1w": 0.0, "long_term": 0.0}
         total_volume = 0.0
         total_abs_gex = 0.0
+        net_gex_accum = 0.0
+        call_gex_accum = 0.0
+        put_gex_accum = 0.0
         total_vanna_exp = 0.0
         total_charm_exp = 0.0
         vanna_call_exp = 0.0
         vanna_put_exp = 0.0
         charm_call_exp = 0.0
         charm_put_exp = 0.0
+        # (strike, iv, oi, dte_years, sign) for gamma-flip spot sweep
         gex_inputs: list[tuple[float, float, float, float, float]] = []
 
+        # Accumulate total volume from raw rows (not in enriched surface).
         for r in rows:
             try:
-                k = float(r.get("strike")) if r.get("strike") is not None else None
-                iv = float(r.get("iv")) if r.get("iv") is not None else None
-                oi = float(r.get("openInterest")) if r.get("openInterest") is not None else None
-                exp = float(r.get("expiration")) if r.get("expiration") is not None else None
-                side = str(r.get("side") or "").lower()
                 vol = float(r.get("volume")) if r.get("volume") is not None else None
             except Exception:
                 continue
             if vol is not None and vol >= 0:
                 total_volume += vol
-            if None in (k, iv, oi, exp) or k <= 0 or iv <= 0 or oi < 0 or spot <= 0:
+
+        for e in surface:
+            try:
+                k = float(e["strike"])
+                iv = float(e["iv"])
+                oi = float(e["open_interest"])
+                gamma_val = float(e["gamma"])
+                dte_days = float(e["dte"])
+                side = str(e["type"]).lower()
+            except (KeyError, TypeError, ValueError):
                 continue
-            t = max((exp - now_ts) / sec_per_year, 1.0 / 365.0)
+            if k <= 0 or iv <= 0 or oi < 0 or spot <= 0:
+                continue
+            sign = 1.0 if side == "call" else -1.0
+            gex = sign * gamma_val * oi * contract_mult * (spot**2) * 0.01
+            net_gex_accum += gex
+            if side == "call":
+                call_gex_accum += gex
+            else:
+                put_gex_accum += gex
+            t = max(dte_days / 365.0, 1.0 / 365.0)
+            gex_inputs.append((k, iv, oi, t, sign))
+
+            # Vanna/charm exposures from d1/d2 (need iv, strike, dte).
             d1 = (math.log(spot / k) + (risk_free + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
             d2 = d1 - iv * math.sqrt(t)
             pdf_d1 = _norm_pdf(d1)
-            gamma = pdf_d1 / (spot * iv * math.sqrt(t))
-            sign = 1.0 if side == "call" else -1.0
-            gex = sign * gamma * oi * contract_mult * (spot**2) * 0.01
-            gex_inputs.append((k, iv, oi, exp, sign))
 
-            # Estimated vanna/charm exposures for risk-profile diagnostics.
             vanna = pdf_d1 * (-d2 / iv)
             vanna_exp = sign * vanna * oi * contract_mult * spot * 0.01
 
@@ -1554,10 +1706,9 @@ class UnifiedDataService:
             total_abs_gex += abs(gex)
             net_by_strike[k] = net_by_strike.get(k, 0.0) + gex
 
-            dte = (exp - now_ts) / (24.0 * 3600.0)
-            if dte <= 1.0:
+            if dte_days <= 1.0:
                 bucket_net["zero_dte"] += gex
-            elif dte <= 7.0:
+            elif dte_days <= 7.0:
                 bucket_net["near_term_1w"] += gex
             else:
                 bucket_net["long_term"] += gex
@@ -1569,8 +1720,7 @@ class UnifiedDataService:
             if test_spot <= 0:
                 return 0.0
             total = 0.0
-            for k, iv, oi, exp, sign in gex_inputs:
-                t = max((exp - now_ts) / sec_per_year, 1.0 / 365.0)
+            for k, iv, oi, t, sign in gex_inputs:
                 d1 = (math.log(test_spot / k) + (risk_free + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
                 gamma = _norm_pdf(d1) / (test_spot * iv * math.sqrt(t))
                 total += sign * gamma * oi * contract_mult * (test_spot**2) * 0.01
@@ -1616,20 +1766,6 @@ class UnifiedDataService:
         def _pct(v: float) -> float | None:
             return (abs(v) / total_abs_bucket * 100.0) if total_abs_bucket > 0 else None
 
-        # Sample three strikes closest to spot.
-        profile_data_sample: list[dict[str, Any]] = []
-        if strikes and spot > 0:
-            near = sorted(strikes, key=lambda x: abs(x - spot))[:3]
-            for k in sorted(near):
-                val = net_by_strike.get(k, 0.0)
-                if val > 0:
-                    bias = "call_heavy"
-                elif val < 0:
-                    bias = "put_heavy"
-                else:
-                    bias = "balanced"
-                profile_data_sample.append({"strike": float(k), "net_gex": float(val), "side_bias": bias})
-
         # Approx OPEX-week flag: current week contains 3rd Friday.
         today = datetime.utcnow().date()
         first_day = today.replace(day=1)
@@ -1640,37 +1776,18 @@ class UnifiedDataService:
         is_opex_week = (today - timedelta(days=today.weekday())) <= opex_date <= (today + timedelta(days=6 - today.weekday()))
 
         mean_iv = None
-        iv_vals = [float(r.get("iv")) for r in rows if r.get("iv") is not None]
+        iv_vals = [float(e["iv"]) for e in surface if e.get("iv") is not None]
         if iv_vals:
             mean_iv = sum(iv_vals) / len(iv_vals)
 
-        net_gex = float(summary.get("net_gex_est") or 0.0)
-        call_gex_nominal = float(summary.get("call_gex_est") or 0.0)
-        put_gex_nominal = float(summary.get("put_gex_est") or 0.0)
+        net_gex = net_gex_accum
+        call_gex_nominal = call_gex_accum
+        put_gex_nominal = put_gex_accum
         put_share = (abs(put_gex_nominal) / (abs(call_gex_nominal) + abs(put_gex_nominal))) if (abs(call_gex_nominal) + abs(put_gex_nominal)) > 0 else None
         gamma_skew = (abs(put_gex_nominal) / abs(call_gex_nominal)) if abs(call_gex_nominal) > 0 else None
         gamma_purity = (net_gex / total_abs_gex) if total_abs_gex > 0 else None
-        tail_risk_warning = bool((put_share is not None and put_share > 0.7) and (net_gex < 0.0))
 
         zero_dte_pct = _pct(bucket_net["zero_dte"])
-        spot_near_flip = bool(
-            gamma_flip_price is not None
-            and spot > 0
-            and (abs(spot - float(gamma_flip_price)) / spot) <= 0.01
-        )
-
-        vanna_regime = "positive_vanna" if total_vanna_exp >= 0 else "negative_vanna"
-        charm_regime = "positive_charm" if total_charm_exp >= 0 else "negative_charm"
-        flow_interpretation = {
-            "vanna_regime": vanna_regime,
-            "charm_regime": charm_regime,
-            "tail_risk_warning": tail_risk_warning,
-            "notes": [
-                "negative_vanna often amplifies rebound sensitivity when IV compresses",
-                "positive_charm can create passive buy-to-hedge drift into expiry",
-                "negative_charm can create passive sell-to-hedge drift into expiry",
-            ],
-        }
 
         # Underlying dollar-volume proxy (20D avg) for GEX dominance checks.
         avg_underlying_dollar_volume_20d = None
@@ -1743,82 +1860,155 @@ class UnifiedDataService:
             except Exception:
                 pass
 
-        out = {
-            "metadata": {
-                "symbol": str(symbol).strip().upper(),
+        # Strike profile summary: top positive/negative GEX strikes, top/bottom IV contracts.
+        sorted_positive = sorted(
+            ((k, v) for k, v in net_by_strike.items() if v > 0),
+            key=lambda x: x[1], reverse=True,
+        )[:5]
+        sorted_negative = sorted(
+            ((k, v) for k, v in net_by_strike.items() if v < 0),
+            key=lambda x: x[1],
+        )[:5]
+        top_positive_gex = [{"strike": float(k), "net_gex": float(v)} for k, v in sorted_positive]
+        top_negative_gex = [{"strike": float(k), "net_gex": float(v)} for k, v in sorted_negative]
+
+        iv_sorted = sorted(
+            (e for e in surface if e.get("iv") is not None),
+            key=lambda x: float(x["iv"]),
+        )
+        top_iv = [
+            {"strike": float(e["strike"]), "type": e["type"], "iv": float(e["iv"]), "dte": float(e["dte"])}
+            for e in iv_sorted[-5:]
+        ][::-1]
+        bot_iv = [
+            {"strike": float(e["strike"]), "type": e["type"], "iv": float(e["iv"]), "dte": float(e["dte"])}
+            for e in iv_sorted[:5]
+        ]
+
+        # base_data: P/C ratios from raw rows.
+        call_rows = sum(1 for r in rows if str(r.get("side") or "").lower() == "call")
+        put_rows = sum(1 for r in rows if str(r.get("side") or "").lower() == "put")
+        call_oi_sum = 0.0
+        put_oi_sum = 0.0
+        call_vol_sum = 0.0
+        put_vol_sum = 0.0
+        strike_vals: list[float] = []
+        expirations_set: set[str] = set()
+        for r in rows:
+            side = str(r.get("side") or "").lower()
+            oi_v = r.get("openInterest")
+            vol_v = r.get("volume")
+            strike_v = r.get("strike")
+            exp_v = r.get("expiration")
+            try:
+                oi_f = float(oi_v) if oi_v is not None else 0.0
+                vol_f = float(vol_v) if vol_v is not None else 0.0
+            except (TypeError, ValueError):
+                oi_f = 0.0
+                vol_f = 0.0
+            if side == "call":
+                call_oi_sum += oi_f
+                call_vol_sum += vol_f
+            elif side == "put":
+                put_oi_sum += oi_f
+                put_vol_sum += vol_f
+            if strike_v is not None:
+                try:
+                    strike_vals.append(float(strike_v))
+                except (TypeError, ValueError):
+                    pass
+            if exp_v is not None:
+                expirations_set.add(str(exp_v))
+
+        pc_ratio_oi = (put_oi_sum / call_oi_sum) if call_oi_sum > 0 else None
+        pc_ratio_vol = (put_vol_sum / call_vol_sum) if call_vol_sum > 0 else None
+
+        sym_upper = str(symbol).strip().upper()
+
+        out: dict[str, Any] = {
+            "base_data": {
+                "symbol": sym_upper,
                 "spot_price": spot,
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "gamma_flip_price": float(gamma_flip_price) if gamma_flip_price is not None else None,
-                "data_quality": {
-                    "rows_total": rows_total,
-                    "rows_usable": rows_usable,
-                    "quality_score": quality,
+                "rows_total": rows_total,
+                "expirations_count": len(expirations_set),
+                "put_call_ratio_oi": pc_ratio_oi,
+                "put_call_ratio_volume": pc_ratio_vol,
+            },
+            "gex_data": {
+                "metadata": {
+                    "symbol": sym_upper,
+                    "spot_price": spot,
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "gamma_flip_price": float(gamma_flip_price) if gamma_flip_price is not None else None,
+                    "data_quality": {
+                        "rows_total": rows_total,
+                        "rows_usable": rows_usable,
+                        "quality_score": quality,
+                        "mean_iv": mean_iv,
+                    },
+                },
+                "aggregate_stats": {
+                    "net_gex_nominal": net_gex,
+                    "call_gex_nominal": call_gex_nominal,
+                    "put_gex_nominal": put_gex_nominal,
+                    "gex_to_volume_ratio": (float(net_gex) / total_volume) if total_volume > 0 else None,
+                    "total_abs_gex": total_abs_gex,
+                    "gamma_purity": gamma_purity,
+                    "concentration_index": concentration_index,
+                    "gamma_skew": gamma_skew,
+                    "put_gex_share": put_share,
+                    "avg_underlying_dollar_volume_20d": avg_underlying_dollar_volume_20d,
+                    "gex_to_underlying_dollar_volume_ratio": gex_to_underlying_dollar_volume_ratio,
+                },
+                "key_levels": {
+                    "gamma_flip_price": float(gamma_flip_price) if gamma_flip_price is not None else None,
+                    "zero_gamma_distance_pct": float(zero_gamma_distance_pct) if zero_gamma_distance_pct is not None else None,
+                    "call_wall": float(call_wall) if call_wall is not None else None,
+                    "put_wall": float(put_wall) if put_wall is not None else None,
+                    "max_gamma_strike": float(max_gamma_strike) if max_gamma_strike is not None else None,
+                },
+                "risk_profile": {
+                    "vanna_exposure*": float(total_vanna_exp),
+                    "charm_exposure*": float(total_charm_exp),
+                    "vanna_call_exposure*": float(vanna_call_exp),
+                    "vanna_put_exposure*": float(vanna_put_exp),
+                    "charm_call_exposure*": float(charm_call_exp),
+                    "charm_put_exposure*": float(charm_put_exp),
+                    "is_opex_week": bool(is_opex_week),
+                    "volatility_bias": "stabilizing" if net_gex >= 0 else "amplifying",
+                },
+                "term_structure": {
+                    "zero_dte": {"net_gex": float(bucket_net["zero_dte"]), "pct": zero_dte_pct},
+                    "near_term_1w": {"net_gex": float(bucket_net["near_term_1w"]), "pct": _pct(bucket_net["near_term_1w"])},
+                    "long_term": {"net_gex": float(bucket_net["long_term"]), "pct": _pct(bucket_net["long_term"])},
+                },
+                "strike_profile_summary": {
+                    "top_positive_gex_strikes": top_positive_gex,
+                    "top_negative_gex_strikes": top_negative_gex,
+                    "top_iv_contracts": top_iv,
+                    "bot_iv_contracts": bot_iv,
+                },
+                "assumptions": {
+                    "pricing_model": "Black-Scholes",
+                    "greek_source": "chain iv + oi",
+                    "method": "Black-Scholes gamma estimated from chain iv/oi",
                     "contract_multiplier": contract_mult,
-                    "mean_iv": mean_iv,
+                    "risk_free_rate": risk_free,
+                    "risk_free_rate_source": meta.get("risk_free_rate_source"),
+                    "expiration": resolved_expiration,
+                    "exp_date_filter": _exp_date_input,
+                    "exp_date_resolved": _exp_date_resolved if _exp_date_resolved else None,
                 },
             },
-            "aggregate_stats": {
-                "net_gex_nominal": net_gex,
-                "call_gex_nominal": call_gex_nominal,
-                "put_gex_nominal": put_gex_nominal,
-                "regime": summary.get("gamma_regime_est") or ("positive_gamma" if net_gex >= 0 else "negative_gamma"),
-                "alt_sign_convention": float(summary.get("net_gex_alt_sign") or -net_gex),
-                "gex_to_volume_ratio": (float(net_gex) / total_volume) if total_volume > 0 else None,
-                "total_abs_gex": total_abs_gex,
-                "gamma_purity": gamma_purity,
-                "concentration_index": concentration_index,
-                "gamma_skew": gamma_skew,
-                "put_gex_share": put_share,
-                "tail_risk_warning": tail_risk_warning,
-                "avg_underlying_dollar_volume_20d": avg_underlying_dollar_volume_20d,
-                "gex_to_underlying_dollar_volume_ratio": gex_to_underlying_dollar_volume_ratio,
-            },
-            "key_levels": {
-                "gamma_flip_price": float(gamma_flip_price) if gamma_flip_price is not None else None,
-                "zero_gamma_distance_pct": float(zero_gamma_distance_pct) if zero_gamma_distance_pct is not None else None,
-                "call_wall": float(call_wall) if call_wall is not None else None,
-                "put_wall": float(put_wall) if put_wall is not None else None,
-                "max_gamma_strike": float(max_gamma_strike) if max_gamma_strike is not None else None,
-            },
-            "risk_profile": {
-                "vanna_exposure*": float(total_vanna_exp),
-                "charm_exposure*": float(total_charm_exp),
-                "vanna_call_exposure*": float(vanna_call_exp),
-                "vanna_put_exposure*": float(vanna_put_exp),
-                "charm_call_exposure*": float(charm_call_exp),
-                "charm_put_exposure*": float(charm_put_exp),
-                "is_opex_week": bool(is_opex_week),
-                "volatility_bias": "stabilizing" if net_gex >= 0 else "amplifying",
-            },
-            "term_structure": {
-                "zero_dte": {"net_gex": float(bucket_net["zero_dte"]), "pct": zero_dte_pct},
-                "near_term_1w": {"net_gex": float(bucket_net["near_term_1w"]), "pct": _pct(bucket_net["near_term_1w"])},
-                "long_term": {"net_gex": float(bucket_net["long_term"]), "pct": _pct(bucket_net["long_term"])},
-            },
-            "profile_data_sample": profile_data_sample,
-            "flow_interpretation": flow_interpretation,
-            "regime_mapping": {
-                "volatility_acceleration": {
-                    "condition": net_gex < 0.0,
-                    "trigger": "net_gex_nominal < 0",
-                    "advice": "Avoid aggressive left-side dip buying; place protective stop below put_wall.",
-                },
-                "transition_zone": {
-                    "condition": spot_near_flip,
-                    "trigger": "abs(spot-gamma_flip_price)/spot <= 1%",
-                    "advice": "Volatility regime may switch soon; reduce short-vol inventory / consider take-profit on short-vol trades.",
-                },
-                "speculative_noise": {
-                    "condition": bool(zero_dte_pct is not None and zero_dte_pct > 50.0),
-                    "trigger": "zero_dte_pct > 50%",
-                    "advice": "Signal is mainly intraday; avoid using it as standalone swing horizon anchor.",
-                },
-            },
-            "assumptions": {
-                "method": "Black-Scholes gamma estimated from chain iv/oi",
-                "risk_free_rate": risk_free,
-                "risk_free_rate_source": meta.get("risk_free_rate_source"),
-                "expiration": resolved_expiration,
+            "debug": {
+                "call_rows": call_rows,
+                "put_rows": put_rows,
+                "strike_min": min(strike_vals) if strike_vals else None,
+                "strike_max": max(strike_vals) if strike_vals else None,
+                "call_oi_sum": call_oi_sum,
+                "put_oi_sum": put_oi_sum,
+                "call_vol_sum": call_vol_sum,
+                "put_vol_sum": put_vol_sum,
             },
         }
         return out
